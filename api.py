@@ -25,6 +25,7 @@ from io import BytesIO
 from PIL import Image
 import numpy as np
 import threading
+import aiohttp
 from collections import defaultdict
 
 # --- 1. ENVIRONMENT SETUP (Mirrors studio.py) ---
@@ -409,6 +410,16 @@ class GenerationRequest(BaseModel):
         description="Save generation metadata to JSON"
     )
     
+    # === CALLBACK/WEBHOOK SETTINGS ===
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST job completion data to (webhook). Will receive job_id, status, result_url, video_download_url, and metadata."
+    )
+    callback_token: Optional[str] = Field(
+        default=None,
+        description="Optional bearer token to include in callback Authorization header"
+    )
+    
     # === VALIDATORS ===
     @validator('resolution_w', 'resolution_h')
     def validate_resolution(cls, v):
@@ -766,6 +777,10 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
         
         # Metadata
         'save_metadata_checked': req.save_metadata,
+        
+        # Callback/Webhook settings
+        'callback_url': req.callback_url,
+        'callback_token': req.callback_token,
     }
     
     # Add to queue
@@ -1072,7 +1087,218 @@ async def stream_progress(job_id: str, x_api_key: str = Header(None)):
     )
 
 
-# --- 19. STARTUP EVENT ---
+# --- 19. CALLBACK/WEBHOOK SYSTEM ---
+
+async def send_job_callback(job_id: str, job: Any, base_url: str = "http://localhost:8000"):
+    """
+    Send a callback/webhook POST request when a job completes.
+    This notifies external services (like Supabase Edge Functions) about job completion.
+    """
+    callback_url = job.params.get('callback_url')
+    if not callback_url:
+        logger.debug(f"No callback_url for job {job_id}, skipping callback")
+        return
+    
+    logger.info(f"Sending callback for job {job_id} to {callback_url}")
+    
+    try:
+        # Build callback payload
+        payload = {
+            "job_id": job_id,
+            "status": job.status.value,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "completed_at": job.completed_at,
+            "error": job.error,
+        }
+        
+        # Add result info if job completed successfully
+        if job.status == JobStatus.COMPLETED and job.result:
+            filename = os.path.basename(job.result)
+            payload["result_url"] = f"/outputs/{filename}"
+            payload["video_download_url"] = f"{base_url}/outputs/{filename}"
+            payload["video_filename"] = filename
+            payload["video_local_path"] = job.result
+            
+            # Add file size if available
+            try:
+                payload["video_file_size"] = os.path.getsize(job.result)
+            except:
+                pass
+        
+        # Add generation metadata
+        payload["metadata"] = {
+            "model_type": job.params.get('model_type'),
+            "prompt": job.params.get('prompt_text'),
+            "negative_prompt": job.params.get('n_prompt'),
+            "seed": job.params.get('seed'),
+            "steps": job.params.get('steps'),
+            "cfg": job.params.get('cfg'),
+            "gs": job.params.get('gs'),
+            "resolution_w": job.params.get('resolutionW'),
+            "resolution_h": job.params.get('resolutionH'),
+            "total_second_length": job.params.get('total_second_length'),
+        }
+        
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json",
+            "X-Job-ID": job_id,
+        }
+        
+        # Add authorization token if provided
+        callback_token = job.params.get('callback_token')
+        if callback_token:
+            headers["Authorization"] = f"Bearer {callback_token}"
+        
+        # Send the callback
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                response_text = await response.text()
+                if response.status >= 200 and response.status < 300:
+                    logger.info(f"Callback successful for job {job_id}: {response.status}")
+                    logger.debug(f"Callback response: {response_text}")
+                else:
+                    logger.warning(f"Callback failed for job {job_id}: {response.status} - {response_text}")
+                    
+    except asyncio.TimeoutError:
+        logger.error(f"Callback timeout for job {job_id} to {callback_url}")
+    except Exception as e:
+        logger.error(f"Callback error for job {job_id}: {str(e)}")
+
+
+# Background task to check for completed jobs and send callbacks
+async def process_job_callbacks():
+    """
+    Background task that monitors for completed jobs and sends callbacks.
+    This runs periodically to catch any jobs that completed.
+    """
+    processed_callbacks = set()  # Track jobs we've already sent callbacks for
+    
+    while True:
+        try:
+            jobs = job_queue.get_all_jobs()
+            for job in jobs:
+                # Only process completed/failed jobs with callback_url that we haven't processed yet
+                if job.id not in processed_callbacks:
+                    if job.status in [JobStatus.COMPLETED, JobStatus.FAILED] and job.params.get('callback_url'):
+                        await send_job_callback(job.id, job)
+                        processed_callbacks.add(job.id)
+            
+            # Clean up old entries from processed_callbacks (keep only recent ones)
+            if len(processed_callbacks) > 1000:
+                # Get current job IDs
+                current_job_ids = {job.id for job in jobs}
+                # Remove IDs that are no longer in the queue
+                processed_callbacks = processed_callbacks.intersection(current_job_ids)
+                
+        except Exception as e:
+            logger.error(f"Error in callback processor: {e}")
+        
+        await asyncio.sleep(2)  # Check every 2 seconds
+
+
+# --- 20. DELETE/CLEANUP ENDPOINTS ---
+
+@app.delete("/outputs/{filename}", tags=["Cleanup"])
+async def delete_output_file(filename: str, x_api_key: str = Header(None)):
+    """
+    Delete a video file from the outputs directory.
+    Use this after successfully uploading to external storage (e.g., Supabase).
+    
+    This endpoint is typically called by your webhook handler after it has:
+    1. Received the callback notification
+    2. Downloaded and uploaded the video to Supabase Storage
+    3. Updated the database record
+    """
+    validate_api_key(x_api_key)
+    
+    # Sanitize filename to prevent path traversal
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(api_output_dir, safe_filename)
+    
+    # Check if file exists
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"File {safe_filename} not found")
+    
+    # Verify the file is within our outputs directory (security check)
+    real_path = os.path.realpath(file_path)
+    real_output_dir = os.path.realpath(api_output_dir)
+    if not real_path.startswith(real_output_dir):
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    try:
+        os.remove(file_path)
+        logger.info(f"Deleted output file: {safe_filename}")
+        
+        # Also try to delete associated metadata file if it exists
+        metadata_file = file_path.replace('.mp4', '.json')
+        if os.path.exists(metadata_file):
+            os.remove(metadata_file)
+            logger.info(f"Deleted metadata file: {os.path.basename(metadata_file)}")
+        
+        return {
+            "success": True,
+            "message": f"File {safe_filename} deleted successfully",
+            "deleted_files": [safe_filename]
+        }
+    except Exception as e:
+        logger.error(f"Error deleting file {safe_filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
+
+
+@app.post("/cleanup/job/{job_id}", tags=["Cleanup"])
+async def cleanup_job_files(job_id: str, x_api_key: str = Header(None)):
+    """
+    Clean up all files associated with a specific job.
+    Deletes the output video and any intermediate files.
+    """
+    validate_api_key(x_api_key)
+    
+    job = job_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    deleted_files = []
+    errors = []
+    
+    # Delete main result file
+    if job.result and os.path.exists(job.result):
+        try:
+            os.remove(job.result)
+            deleted_files.append(os.path.basename(job.result))
+            logger.info(f"Deleted job result: {job.result}")
+        except Exception as e:
+            errors.append(f"Error deleting {job.result}: {str(e)}")
+    
+    # Find and delete any intermediate files for this job
+    try:
+        for filename in os.listdir(api_output_dir):
+            if filename.startswith(f"{job_id}_") or filename.startswith(job_id):
+                file_path = os.path.join(api_output_dir, filename)
+                try:
+                    os.remove(file_path)
+                    deleted_files.append(filename)
+                    logger.info(f"Deleted intermediate file: {filename}")
+                except Exception as e:
+                    errors.append(f"Error deleting {filename}: {str(e)}")
+    except Exception as e:
+        errors.append(f"Error scanning output directory: {str(e)}")
+    
+    return {
+        "success": len(errors) == 0,
+        "job_id": job_id,
+        "deleted_files": deleted_files,
+        "errors": errors if errors else None
+    }
+
+
+# --- 21. STARTUP EVENT ---
 
 @app.on_event("startup")
 async def startup_event():
@@ -1085,9 +1311,13 @@ async def startup_event():
     logger.info(f"Output Directory: {api_output_dir}")
     logger.info(f"LoRAs Available: {len([l for l in lora_names if l != DUMMY_LORA_NAME])}")
     logger.info("=" * 50)
+    
+    # Start the callback processor background task
+    asyncio.create_task(process_job_callbacks())
+    logger.info("Callback processor started")
 
 
-# --- 20. MAIN ---
+# --- 22. MAIN ---
 
 if __name__ == "__main__":
     print("\n" + "=" * 50)

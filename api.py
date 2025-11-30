@@ -62,6 +62,12 @@ if API_SECRET == "CHANGE_ME_IN_PRODUCTION":
 RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "10"))  # requests per window
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # window in seconds
 
+# Base URL for callbacks - MUST be set to your public RunPod URL!
+# Example: https://wt2g7dvyejayg0-8000.proxy.runpod.net
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+if BASE_URL == "http://localhost:8000":
+    logger.warning("⚠️  WARNING: BASE_URL is localhost! Set BASE_URL environment variable to your public RunPod URL for callbacks to work!")
+
 # --- 5. GLOBAL VARIABLES (CRITICAL for worker.py) ---
 print("--- [API] INITIALIZING FRAMEPACK ENGINE ---")
 logger.info("Initializing FramePack Engine...")
@@ -1187,7 +1193,7 @@ async def process_job_callbacks():
                 # Only process completed/failed jobs with callback_url that we haven't processed yet
                 if job.id not in processed_callbacks:
                     if job.status in [JobStatus.COMPLETED, JobStatus.FAILED] and job.params.get('callback_url'):
-                        await send_job_callback(job.id, job)
+                        await send_job_callback(job.id, job, base_url=BASE_URL)
                         processed_callbacks.add(job.id)
             
             # Clean up old entries from processed_callbacks (keep only recent ones)

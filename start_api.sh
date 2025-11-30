@@ -40,11 +40,19 @@ export RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-20}
 export RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-60}
 echo "✅ Rate limit: $RATE_LIMIT_REQUESTS requests per $RATE_LIMIT_WINDOW seconds"
 
-# 6. GPU Memory Preservation (CRITICAL for RTX 4090)
-# Higher value = more memory reserved = prevents OOM errors
-# For RTX 4090 (24GB), use 20. For 48GB+, can use 6-10.
+# GPU Memory Preservation (20GB for RTX 4090)
 export GPU_MEMORY_PRESERVATION=${GPU_MEMORY_PRESERVATION:-20}
 echo "✅ GPU Memory Preservation: $GPU_MEMORY_PRESERVATION GB"
+
+# 6. BASE URL for callbacks (IMPORTANT for webhooks!)
+# Set this to your public RunPod URL
+if [ -z "$BASE_URL" ]; then
+    echo "⚠️  BASE_URL not set! Callbacks will use localhost (won't work externally)"
+    echo "   Set it like: export BASE_URL=https://your-runpod-id-8000.proxy.runpod.net"
+else
+    export BASE_URL="$BASE_URL"
+    echo "✅ BASE_URL set to: $BASE_URL"
+fi
 
 # 7. Launch the API
 echo ""

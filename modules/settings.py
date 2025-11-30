@@ -14,7 +14,7 @@ class Settings:
         # Set default paths relative to project root
         self.default_settings = {
             "save_metadata": True,
-            "gpu_memory_preservation": 6,
+            "gpu_memory_preservation": 20,  # Changed from 6 to 20 for RTX 4090 compatibility
             "output_dir": str(project_root / "outputs"),
             "metadata_dir": str(project_root / "outputs"),
             "lora_dir": str(project_root / "loras"),

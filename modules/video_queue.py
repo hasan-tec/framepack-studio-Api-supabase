@@ -1451,11 +1451,16 @@ class VideoJobQueue:
                     print(f"Starting worker function for job {job_id}")
                     
                     # Clean up params for the worker function
+                    # Remove API-specific params that worker() doesn't accept
                     worker_params = job.params.copy()
                     if 'end_frame_image_original' in worker_params:
                         del worker_params['end_frame_image_original']
                     if 'end_frame_strength_original' in worker_params:
                         del worker_params['end_frame_strength_original']
+                    if 'callback_url' in worker_params:
+                        del worker_params['callback_url']
+                    if 'callback_token' in worker_params:
+                        del worker_params['callback_token']
 
                     async_run(
                         self.worker_function,

@@ -127,10 +127,15 @@ else:
         del os.environ['HF_HUB_OFFLINE']
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
-high_vram = free_mem_gb > 60
+# Allow forcing low VRAM mode even on high VRAM GPUs (helps with very long videos)
+force_low_vram = os.environ.get("FORCE_LOW_VRAM", "false").lower() == "true"
+high_vram = (free_mem_gb > 60) and not force_low_vram
 
 print(f'Free VRAM {free_mem_gb} GB')
-print(f'High-VRAM Mode: {high_vram}')
+if force_low_vram:
+    print(f'FORCED Low-VRAM Mode (enables VAE slicing/tiling for long videos)')
+else:
+    print(f'High-VRAM Mode: {high_vram}')
 
 # Load models
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()

@@ -97,8 +97,13 @@ prompt_embedding_cache = {}
 
 # Check Hardware
 free_mem_gb = get_cuda_free_memory_gb(gpu)
-high_vram = free_mem_gb > 60
-logger.info(f'Free VRAM: {free_mem_gb:.2f} GB | High-VRAM Mode: {high_vram}')
+# Allow forcing low VRAM mode even on high VRAM GPUs (helps with very long videos)
+force_low_vram = os.environ.get("FORCE_LOW_VRAM", "false").lower() == "true"
+high_vram = (free_mem_gb > 60) and not force_low_vram
+if force_low_vram:
+    logger.info(f'Free VRAM: {free_mem_gb:.2f} GB | FORCED Low-VRAM Mode (enables VAE slicing/tiling)')
+else:
+    logger.info(f'Free VRAM: {free_mem_gb:.2f} GB | High-VRAM Mode: {high_vram}')
 
 # --- 6. MODEL LOADING (Mirrors studio.py) ---
 logger.info("Loading Core Models...")

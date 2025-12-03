@@ -6,7 +6,7 @@
 # ============================================================
 
 # 1. Navigate to the correct folder
-cd /workspace/FramePack-Studio
+cd /workspace/framepack-studio-Api-supabase
 
 # 2. Activate the virtual environment
 if [ -d "venv" ]; then
@@ -43,6 +43,8 @@ echo "✅ Rate limit: $RATE_LIMIT_REQUESTS requests per $RATE_LIMIT_WINDOW secon
 # GPU Memory Preservation (20GB for RTX 4090)
 export GPU_MEMORY_PRESERVATION=${GPU_MEMORY_PRESERVATION:-20}
 echo "✅ GPU Memory Preservation: $GPU_MEMORY_PRESERVATION GB"
+
+export FORCE_LOW_VRAM=true
 
 # 6. BASE URL for callbacks (IMPORTANT for webhooks!)
 # Set this to your public RunPod URL

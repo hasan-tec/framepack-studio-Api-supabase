@@ -533,11 +533,19 @@ async def download_image_from_url(url: str) -> np.ndarray:
 
 
 def apply_bucket_resolution(width: int, height: int) -> tuple:
-    """Apply bucket resolution system like Gradio does"""
+    """Apply bucket resolution system like Gradio does.
+    
+    Note: find_nearest_bucket expects (h, w) and returns (bucket_h, bucket_w).
+    We pass (height, width) and use average of both as the resolution parameter,
+    matching how Gradio handles it when no input image is provided.
+    """
     try:
-        bucket_width, bucket_height = find_nearest_bucket(width, height, resolution=640)
-        logger.info(f"Resolution adjusted: {width}x{height} -> {bucket_width}x{bucket_height}")
-        return bucket_width, bucket_height
+        # Use average of width and height as resolution, matching Gradio's behavior
+        resolution = (width + height) // 2
+        # find_nearest_bucket expects (h, w) order and returns (bucket_h, bucket_w)
+        bucket_h, bucket_w = find_nearest_bucket(height, width, resolution=resolution)
+        logger.info(f"Resolution adjusted: {width}x{height} -> {bucket_w}x{bucket_h} (using resolution bucket {resolution})")
+        return bucket_w, bucket_h
     except Exception as e:
         logger.warning(f"Bucket resolution failed, using original: {e}")
         return width, height
@@ -672,8 +680,15 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
     
     logger.info(f"New generation request: model={req.model_type}, prompt={req.prompt[:50]}...")
     
-    # Apply bucket resolution
-    bucket_w, bucket_h = apply_bucket_resolution(req.resolution_w, req.resolution_h)
+    # NOTE: We pass raw resolution values to the worker, just like Gradio does.
+    # The pipeline's preprocess_inputs() handles bucket calculation based on:
+    # - If has_input_image: uses image dimensions + resolutionW as bucket tier
+    # - If no image: uses resolutionH, resolutionW + average as bucket tier
+    # This ensures consistent behavior between API and Gradio.
+    
+    # Log what bucket will likely be used (for informational purposes only)
+    estimated_bucket_h, estimated_bucket_w = apply_bucket_resolution(req.resolution_w, req.resolution_h)
+    logger.info(f"Resolution requested: {req.resolution_w}x{req.resolution_h} -> estimated bucket: {estimated_bucket_w}x{estimated_bucket_h}")
     
     # Process input image if provided
     input_image = None
@@ -689,10 +704,11 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
         has_input_image = True
         logger.info(f"Downloaded input image from URL: {input_image.shape}")
     
-    # If no input image, create latent background for T2V
+    # If no input image, create latent background for T2V using RAW resolution
+    # The pipeline will resize this to the correct bucket size
     if input_image is None:
-        input_image = create_latent_image(bucket_w, bucket_h, req.latent_type)
-        logger.info(f"Created {req.latent_type.value} latent image for T2V")
+        input_image = create_latent_image(req.resolution_w, req.resolution_h, req.latent_type)
+        logger.info(f"Created {req.latent_type.value} latent image for T2V: {req.resolution_w}x{req.resolution_h}")
     
     # Process end frame image if provided
     end_frame_image = None
@@ -751,9 +767,9 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
         'gs': req.gs,
         'rs': req.rs,
         
-        # Resolution (bucket adjusted)
-        'resolutionW': bucket_w,
-        'resolutionH': bucket_h,
+        # Resolution (raw values - pipeline handles bucket calculation, matching Gradio behavior)
+        'resolutionW': req.resolution_w,
+        'resolutionH': req.resolution_h,
         
         # Cache settings - TeaCache
         'use_teacache': use_teacache,
@@ -813,9 +829,9 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
         job_id=job_id,
         status="pending",
         seed=req.seed,
-        resolution={"width": bucket_w, "height": bucket_h},
+        resolution={"width": estimated_bucket_w, "height": estimated_bucket_h},
         estimated_time_seconds=estimated_time,
-        message=f"Job queued successfully. Estimated time: {estimated_time}s"
+        message=f"Job queued successfully. Requested: {req.resolution_w}x{req.resolution_h}, estimated bucket: {estimated_bucket_w}x{estimated_bucket_h}. Time: ~{estimated_time}s"
     )
 
 

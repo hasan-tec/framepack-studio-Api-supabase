@@ -61,7 +61,7 @@ from modules.toolbox_app import (
     _initialize_workflow_presets,
     TB_DEFAULT_FILTER_SETTINGS
 )
-from modules.toolbox.toolbox_processor import VideoProcessor
+from modules.toolbox.toolbox_processor import VideoProcessor, DummyProgress
 from modules.toolbox.system_monitor import SystemMonitor
 
 # --- PHASE 4 IMPORTS: Filter Presets & Model Management ---
@@ -2014,6 +2014,7 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
                 enhance_face=req.enhance_face,
                 denoise_strength_ui=req.denoise_strength,
                 use_streaming=safe_streaming,
+                progress=DummyProgress(),
                 metadata={
                     "model": req.model,
                     "scale_factor": req.scale_factor,
@@ -2046,7 +2047,8 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
             tile_size=req.tile_size,
             enhance_face=req.enhance_face,
             denoise_strength_ui=req.denoise_strength,
-            use_streaming=req.use_streaming
+            use_streaming=req.use_streaming,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
@@ -2186,6 +2188,7 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
                 target_fps_mode=normalized_fps_mode,
                 speed_factor=req.speed_factor,
                 use_streaming=safe_streaming,
+                progress=DummyProgress(),
                 metadata={
                     "fps_mode": req.fps_mode,
                     "speed_factor": req.speed_factor,
@@ -2212,7 +2215,8 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
             video_path=temp_video_path,
             target_fps_mode=normalized_fps_mode,
             speed_factor=req.speed_factor,
-            use_streaming=req.use_streaming
+            use_streaming=req.use_streaming,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
@@ -2321,7 +2325,8 @@ async def apply_video_filters(req: VideoFiltersRequest, x_api_key: str = Header(
             denoise=req.denoise,
             vignette=req.vignette,
             s_curve_contrast=req.s_curve_contrast,
-            film_grain_strength=req.film_grain
+            film_grain_strength=req.film_grain,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
@@ -2864,7 +2869,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 tile_size=tile_size,
                                 enhance_face=params.get("enhance_face", False),
                                 denoise_strength_ui=params.get("denoise_strength", 0.5),
-                                use_streaming=use_streaming
+                                use_streaming=use_streaming,
+                                progress=DummyProgress()
                             )
                             logger.info(f"[BG-PIPELINE] Upscale returned: {output_path}")
                         
@@ -2881,7 +2887,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 video_path=current_video_path,
                                 target_fps_mode=params.get("fps_mode", "2x"),
                                 speed_factor=params.get("speed_factor", 1.0),
-                                use_streaming=use_streaming
+                                use_streaming=use_streaming,
+                                progress=DummyProgress()
                             )
                             logger.info(f"[BG-PIPELINE] Interpolate returned: {output_path}")
                         
@@ -2899,7 +2906,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 denoise=params.get("denoise", 0.0),
                                 vignette=params.get("vignette", 0.0),
                                 s_curve_contrast=params.get("s_curve_contrast", 0.0),
-                                film_grain_strength=params.get("film_grain", 0.0)
+                                film_grain_strength=params.get("film_grain", 0.0),
+                                progress=DummyProgress()
                             )
                             logger.info(f"[BG-PIPELINE] Filters returned: {output_path}")
                         
@@ -3018,7 +3026,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                     tile_size=params.get("tile_size", 512),
                     enhance_face=params.get("enhance_face", False),
                     denoise_strength_ui=params.get("denoise_strength", 0.5),
-                    use_streaming=params.get("use_streaming", True)
+                    use_streaming=params.get("use_streaming", True),
+                    progress=DummyProgress()
                 )
             
             elif op.type == "interpolate":
@@ -3027,7 +3036,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                     video_path=current_video_path,
                     target_fps_mode=params.get("fps_mode", "2x"),
                     speed_factor=params.get("speed_factor", 1.0),
-                    use_streaming=params.get("use_streaming", True)
+                    use_streaming=params.get("use_streaming", True),
+                    progress=DummyProgress()
                 )
             
             elif op.type == "filters":
@@ -3043,7 +3053,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                     denoise=params.get("denoise", 0.0),
                     vignette=params.get("vignette", 0.0),
                     s_curve_contrast=params.get("s_curve_contrast", 0.0),
-                    film_grain_strength=params.get("film_grain", 0.0)
+                    film_grain_strength=params.get("film_grain", 0.0),
+                    progress=DummyProgress()
                 )
             
             elif op.type == "loop":
@@ -4224,7 +4235,8 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                             tile_size=params.get("tile_size", 512),
                             enhance_face=params.get("enhance_face", False),
                             denoise_strength_ui=params.get("denoise_strength", 0.5),
-                            use_streaming=params.get("use_streaming", True)
+                            use_streaming=params.get("use_streaming", True),
+                            progress=DummyProgress()
                         )
                     elif op.type == "interpolate":
                         params = op.params or {}
@@ -4243,7 +4255,8 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                             video_path=current_video_path,
                             target_fps_mode=normalized_fps_mode,
                             speed_factor=params.get("speed_factor", 1.0),
-                            use_streaming=params.get("use_streaming", True)
+                            use_streaming=params.get("use_streaming", True),
+                            progress=DummyProgress()
                         )
                     elif op.type == "filters":
                         params = op.params or {}
@@ -4258,7 +4271,8 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                             denoise=params.get("denoise", 0.0),
                             vignette=params.get("vignette", 0.0),
                             s_curve_contrast=params.get("s_curve_contrast", 0.0),
-                            film_grain_strength=params.get("film_grain", 0.0)
+                            film_grain_strength=params.get("film_grain", 0.0),
+                            progress=DummyProgress()
                         )
                     elif op.type == "loop":
                         params = op.params or {}

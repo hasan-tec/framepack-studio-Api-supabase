@@ -28,6 +28,30 @@ device_name_str = devicetorch.get(torch)
 
 VIDEO_QUALITY = 8 # Used by imageio.mimwrite quality/quantizer
 
+
+# ============================================================================
+# Dummy Progress class for API usage (when not running inside Gradio context)
+# This safely replaces gr.Progress() when toolbox functions are called from API
+# ============================================================================
+class DummyProgress:
+    """
+    A dummy progress class that mimics Gradio's gr.Progress() interface.
+    Used when toolbox functions are called from the API instead of Gradio UI.
+    All methods are no-ops or pass-throughs to tqdm.
+    """
+    def __init__(self):
+        pass
+    
+    def __call__(self, value=None, desc=None):
+        """Called like progress(0.5, desc="Processing...") - just log it"""
+        if desc:
+            print(f"[Progress] {desc} ({value*100:.0f}%)" if value else f"[Progress] {desc}")
+    
+    def tqdm(self, iterable, desc=None, total=None):
+        """Returns a regular tqdm iterator instead of Gradio's special one"""
+        return tqdm(iterable, desc=desc, total=total)
+
+
 class VideoProcessor:
     def __init__(self, message_manager: MessageManager, settings):
         self.message_manager = message_manager

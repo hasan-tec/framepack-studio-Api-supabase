@@ -402,8 +402,8 @@ class UpscaleVideoRequest(BaseModel):
         description="Target scale factor (1.0-4.0, depends on model)"
     )
     tile_size: int = Field(
-        default=0,
-        description="Tile size for processing (0=auto, 256, 512). Smaller uses less VRAM."
+        default=512,
+        description="Tile size for processing (0=no tiling [risky], 256, 512 [recommended]). 512 recommended to prevent OOM."
     )
     enhance_face: bool = Field(
         default=False,
@@ -416,8 +416,8 @@ class UpscaleVideoRequest(BaseModel):
         description="Denoise strength (only for RealESR-general-x4v3 model)"
     )
     use_streaming: bool = Field(
-        default=False,
-        description="Use streaming mode for low memory processing of large videos"
+        default=True,
+        description="Use streaming mode for low memory processing of large videos. Recommended for API use."
     )
     callback_url: Optional[str] = Field(
         default=None,
@@ -440,8 +440,8 @@ class InterpolateVideoRequest(BaseModel):
         description="Speed adjustment factor (0.25=4x slower, 4.0=4x faster)"
     )
     use_streaming: bool = Field(
-        default=False,
-        description="Use streaming mode for low memory processing"
+        default=True,
+        description="Use streaming mode for low memory processing. Recommended for API use."
     )
     callback_url: Optional[str] = Field(
         default=None,

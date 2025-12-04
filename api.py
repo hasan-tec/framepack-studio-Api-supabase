@@ -1258,6 +1258,113 @@ def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
 
 
+# ============================================================================
+# BACKGROUND TASK INFRASTRUCTURE FOR LONG-RUNNING POST-PROCESSING
+# ============================================================================
+# This allows endpoints to return immediately when callback_url is provided,
+# preventing Cloudflare/proxy timeouts (Error 524) during long operations.
+
+import concurrent.futures
+from functools import partial
+
+# Thread pool for background post-processing tasks
+_postprocess_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="postprocess_bg")
+
+def run_postprocess_in_background(
+    operation_name: str,
+    callback_url: str,
+    process_func,
+    cleanup_func=None,
+    **kwargs
+):
+    """
+    Run a post-processing operation in a background thread.
+    Sends callback when complete (success or failure).
+    
+    Args:
+        operation_name: Name of the operation (upscale, interpolate, etc.)
+        callback_url: URL to send results to
+        process_func: The function to run (should return output_path or None)
+        cleanup_func: Optional cleanup function to run after processing
+        **kwargs: Arguments to pass to process_func
+    """
+    def background_task():
+        output_path = None
+        output_base64 = None
+        error_msg = None
+        
+        try:
+            logger.info(f"[BG-TASK] Starting background {operation_name} processing...")
+            
+            # Run the actual processing
+            output_path = process_func(**kwargs)
+            
+            if output_path and os.path.exists(output_path):
+                logger.info(f"[BG-TASK] {operation_name} complete: {output_path}")
+                
+                # Read and encode output
+                with open(output_path, 'rb') as f:
+                    output_base64 = base64.b64encode(f.read()).decode('utf-8')
+                
+                # Send success callback
+                asyncio.run(send_postprocess_callback(
+                    callback_url=callback_url,
+                    operation_type=operation_name,
+                    success=True,
+                    output_path=output_path,
+                    output_base64=output_base64,
+                    metadata=kwargs.get('metadata', {})
+                ))
+            else:
+                error_msg = f"{operation_name} failed - no output produced"
+                logger.error(f"[BG-TASK] {error_msg}")
+                
+                # Send failure callback
+                asyncio.run(send_postprocess_callback(
+                    callback_url=callback_url,
+                    operation_type=operation_name,
+                    success=False,
+                    error=error_msg
+                ))
+                
+        except Exception as e:
+            error_msg = f"{operation_name} failed: {str(e)}"
+            logger.error(f"[BG-TASK] {error_msg}")
+            logger.error(f"[BG-TASK] Traceback: {traceback.format_exc()}")
+            
+            # Send failure callback
+            try:
+                asyncio.run(send_postprocess_callback(
+                    callback_url=callback_url,
+                    operation_type=operation_name,
+                    success=False,
+                    error=error_msg
+                ))
+            except Exception as cb_err:
+                logger.error(f"[BG-TASK] Failed to send error callback: {cb_err}")
+        
+        finally:
+            # Run cleanup if provided
+            if cleanup_func:
+                try:
+                    cleanup_func()
+                except Exception as clean_err:
+                    logger.warning(f"[BG-TASK] Cleanup failed: {clean_err}")
+    
+    # Submit to thread pool
+    _postprocess_executor.submit(background_task)
+    logger.info(f"[BG-TASK] {operation_name} task submitted to background executor")
+
+
+class AsyncProcessingResponse(BaseModel):
+    """Response when processing is started in background"""
+    success: bool = True
+    message: str
+    processing: bool = True
+    callback_url: str
+    note: str = "Results will be sent to your callback URL when processing completes"
+
+
 def apply_bucket_resolution(width: int, height: int) -> tuple:
     """Apply bucket resolution system like Gradio does.
     
@@ -1801,7 +1908,7 @@ async def analyze_video(req: AnalyzeVideoRequest, x_api_key: str = Header(None))
                 logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
 
 
-@app.post("/postprocess/upscale", response_model=UpscaleVideoResponse, tags=["Post-Processing"])
+@app.post("/postprocess/upscale", response_model=Union[UpscaleVideoResponse, AsyncProcessingResponse], tags=["Post-Processing"])
 async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None)):
     """
     Upscale a video using Real-ESRGAN models.
@@ -1815,6 +1922,10 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
     - RealESR_AnimeVideo_v3: 4x anime video specialized
     
     Provide either video_base64 or video_url (not both).
+    
+    **ASYNC MODE**: When callback_url is provided, processing runs in background
+    and results are sent to your callback URL. This prevents timeout errors for
+    long operations.
     """
     validate_api_key(x_api_key)
     
@@ -1857,8 +1968,61 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
             logger.error("[POST-PROCESS] Toolbox processor not initialized")
             raise HTTPException(status_code=500, detail="Post-processing module not available")
         
+        # ================================================================
+        # ASYNC BACKGROUND MODE: When callback_url is provided, run in 
+        # background to prevent Cloudflare/proxy timeouts (Error 524)
+        # ================================================================
+        if req.callback_url:
+            logger.info(f"[POST-PROCESS] Callback URL provided - running upscale in BACKGROUND mode")
+            logger.info(f"[POST-PROCESS] Callback URL: {req.callback_url}")
+            
+            # Define cleanup function
+            cleanup_path = temp_video_path if has_base64 else None
+            def cleanup():
+                if cleanup_path and os.path.exists(cleanup_path):
+                    try:
+                        os.remove(cleanup_path)
+                        logger.debug(f"[BG-CLEANUP] Cleaned up temp file: {cleanup_path}")
+                    except Exception as e:
+                        logger.warning(f"[BG-CLEANUP] Failed to clean up: {e}")
+            
+            # Submit to background executor
+            run_postprocess_in_background(
+                operation_name="upscale",
+                callback_url=req.callback_url,
+                process_func=tb_processor.tb_upscale_video,
+                cleanup_func=cleanup,
+                video_path=temp_video_path,
+                model_key=req.model,
+                output_scale_factor_ui=req.scale_factor,
+                tile_size=req.tile_size,
+                enhance_face=req.enhance_face,
+                denoise_strength_ui=req.denoise_strength,
+                use_streaming=req.use_streaming,
+                metadata={
+                    "model": req.model,
+                    "scale_factor": req.scale_factor,
+                    "tile_size": req.tile_size,
+                    "enhance_face": req.enhance_face,
+                    "denoise_strength": req.denoise_strength
+                }
+            )
+            
+            # Return immediately - no timeout!
+            return AsyncProcessingResponse(
+                success=True,
+                message="Upscale processing started in background",
+                processing=True,
+                callback_url=req.callback_url,
+                note="Results will be sent to your callback URL when processing completes. This may take several minutes for large videos."
+            )
+        
+        # ================================================================
+        # SYNCHRONOUS MODE: No callback URL - process and return directly
+        # ================================================================
+        logger.info("[POST-PROCESS] No callback URL - running upscale in SYNCHRONOUS mode")
+        
         # Call the toolbox processor upscale method
-        # Method signature: tb_upscale_video(video_path, model_key, output_scale_factor_ui, tile_size, enhance_face, denoise_strength_ui, use_streaming)
         output_path = tb_processor.tb_upscale_video(
             video_path=temp_video_path,
             model_key=req.model,
@@ -1879,23 +2043,6 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
         with open(output_path, 'rb') as f:
             output_base64 = base64.b64encode(f.read()).decode('utf-8')
         
-        # Send callback if URL provided
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation_type="upscale",
-                success=True,
-                output_path=output_path,
-                output_base64=output_base64,
-                metadata={
-                    "model": req.model,
-                    "scale_factor": req.scale_factor,
-                    "tile_size": req.tile_size,
-                    "enhance_face": req.enhance_face,
-                    "denoise_strength": req.denoise_strength
-                }
-            )
-        
         return UpscaleVideoResponse(
             success=True,
             message="Video upscaled successfully",
@@ -1904,34 +2051,17 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
         )
         
     except HTTPException:
-        # Send failure callback
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation_type="upscale",
-                success=False,
-                error="Request validation or HTTP error"
-            )
         raise
     except Exception as e:
         error_msg = f"Failed to upscale video: {str(e)}"
         logger.error(f"[POST-PROCESS] {error_msg}")
         logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
-        
-        # Send failure callback
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation_type="upscale",
-                success=False,
-                error=error_msg
-            )
-        
         raise HTTPException(status_code=500, detail=error_msg)
     
     finally:
-        # Clean up temp input file if we created one from base64
-        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+        # Clean up temp input file if we created one from base64 and running synchronously
+        # (Background mode handles its own cleanup)
+        if not req.callback_url and temp_video_path and has_base64 and os.path.exists(temp_video_path):
             try:
                 os.remove(temp_video_path)
                 logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
@@ -1939,7 +2069,7 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
                 logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
 
 
-@app.post("/postprocess/interpolate", response_model=InterpolateVideoResponse, tags=["Post-Processing"])
+@app.post("/postprocess/interpolate", response_model=Union[InterpolateVideoResponse, AsyncProcessingResponse], tags=["Post-Processing"])
 async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Header(None)):
     """
     Interpolate video frames using RIFE to increase smoothness.
@@ -1951,6 +2081,10 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
     Speed factor: Adjust playback speed (1.0 = normal, 0.5 = half speed, 2.0 = double speed)
     
     Provide either video_base64 or video_url (not both).
+    
+    **ASYNC MODE**: When callback_url is provided, processing runs in background
+    and results are sent to your callback URL. This prevents timeout errors for
+    long operations.
     """
     validate_api_key(x_api_key)
     
@@ -2003,8 +2137,56 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
             logger.error("[POST-PROCESS] Toolbox processor not initialized")
             raise HTTPException(status_code=500, detail="Post-processing module not available")
         
+        # ================================================================
+        # ASYNC BACKGROUND MODE: When callback_url is provided, run in 
+        # background to prevent Cloudflare/proxy timeouts (Error 524)
+        # ================================================================
+        if req.callback_url:
+            logger.info(f"[POST-PROCESS] Callback URL provided - running interpolation in BACKGROUND mode")
+            logger.info(f"[POST-PROCESS] Callback URL: {req.callback_url}")
+            
+            # Define cleanup function
+            cleanup_path = temp_video_path if has_base64 else None
+            def cleanup():
+                if cleanup_path and os.path.exists(cleanup_path):
+                    try:
+                        os.remove(cleanup_path)
+                        logger.debug(f"[BG-CLEANUP] Cleaned up temp file: {cleanup_path}")
+                    except Exception as e:
+                        logger.warning(f"[BG-CLEANUP] Failed to clean up: {e}")
+            
+            # Submit to background executor
+            run_postprocess_in_background(
+                operation_name="interpolate",
+                callback_url=req.callback_url,
+                process_func=tb_processor.tb_process_frames,
+                cleanup_func=cleanup,
+                video_path=temp_video_path,
+                target_fps_mode=normalized_fps_mode,
+                speed_factor=req.speed_factor,
+                use_streaming=req.use_streaming,
+                metadata={
+                    "fps_mode": req.fps_mode,
+                    "speed_factor": req.speed_factor,
+                    "use_streaming": req.use_streaming
+                }
+            )
+            
+            # Return immediately - no timeout!
+            return AsyncProcessingResponse(
+                success=True,
+                message="Interpolation processing started in background",
+                processing=True,
+                callback_url=req.callback_url,
+                note="Results will be sent to your callback URL when processing completes. This may take several minutes."
+            )
+        
+        # ================================================================
+        # SYNCHRONOUS MODE: No callback URL - process and return directly
+        # ================================================================
+        logger.info("[POST-PROCESS] No callback URL - running interpolation in SYNCHRONOUS mode")
+        
         # Call the toolbox processor interpolation method
-        # Method signature: tb_process_frames(video_path, target_fps_mode, speed_factor, use_streaming)
         output_path = tb_processor.tb_process_frames(
             video_path=temp_video_path,
             target_fps_mode=normalized_fps_mode,
@@ -2022,22 +2204,6 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
         with open(output_path, 'rb') as f:
             output_base64 = base64.b64encode(f.read()).decode('utf-8')
         
-        # Send callback if URL provided
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation="interpolate",
-                success=True,
-                output_path=output_path,
-                output_video_base64=output_base64,
-                message="Video interpolated successfully",
-                metadata={
-                    "fps_mode": req.fps_mode,
-                    "speed_factor": req.speed_factor,
-                    "use_streaming": req.use_streaming
-                }
-            )
-        
         return InterpolateVideoResponse(
             success=True,
             message="Video interpolated successfully",
@@ -2051,22 +2217,12 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
         error_msg = f"Failed to interpolate video: {str(e)}"
         logger.error(f"[POST-PROCESS] {error_msg}")
         logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
-        
-        # Send error callback if URL provided
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation="interpolate",
-                success=False,
-                error=error_msg,
-                message="Interpolation failed"
-            )
-        
         raise HTTPException(status_code=500, detail=error_msg)
     
     finally:
-        # Clean up temp input file
-        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+        # Clean up temp input file if running synchronously
+        # (Background mode handles its own cleanup)
+        if not req.callback_url and temp_video_path and has_base64 and os.path.exists(temp_video_path):
             try:
                 os.remove(temp_video_path)
                 logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
@@ -2574,7 +2730,7 @@ async def export_video(req: ExportVideoRequest, x_api_key: str = Header(None)):
                 logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
 
 
-@app.post("/postprocess/pipeline", response_model=PipelineResponse, tags=["Post-Processing"])
+@app.post("/postprocess/pipeline", response_model=Union[PipelineResponse, AsyncProcessingResponse], tags=["Post-Processing"])
 async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
     """
     Run a pipeline of multiple post-processing operations on a video.
@@ -2594,6 +2750,10 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
     ]
     
     Provide either video_base64 or video_url (not both).
+    
+    **ASYNC MODE**: When callback_url is provided, processing runs in background
+    and results are sent to your callback URL. This is HIGHLY RECOMMENDED for
+    pipelines as they can take many minutes.
     """
     validate_api_key(x_api_key)
     
@@ -2619,9 +2779,6 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
             raise HTTPException(status_code=400, detail=f"Invalid operation type: {op.type}. Valid types: {valid_ops}")
     
     temp_video_path = None
-    current_video_path = None
-    intermediate_files = []
-    results = []
     
     try:
         # Get video file path
@@ -2635,12 +2792,156 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
             with open(temp_video_path, 'wb') as f:
                 f.write(video_bytes)
         
-        current_video_path = temp_video_path
-        
         # Check if toolbox processor is available
         if tb_processor is None:
             logger.error("[POST-PROCESS] Toolbox processor not initialized")
             raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # ================================================================
+        # ASYNC BACKGROUND MODE: When callback_url is provided, run in 
+        # background to prevent Cloudflare/proxy timeouts (Error 524)
+        # ================================================================
+        if req.callback_url:
+            logger.info(f"[POST-PROCESS] Callback URL provided - running pipeline in BACKGROUND mode")
+            logger.info(f"[POST-PROCESS] Callback URL: {req.callback_url}")
+            
+            # Define the pipeline process function
+            def run_pipeline_operations(input_path, operations, tb_proc, has_b64):
+                """Run all pipeline operations and return final output path"""
+                current_video_path = input_path
+                intermediate_files = []
+                results = []
+                
+                try:
+                    for i, op in enumerate(operations):
+                        logger.info(f"[BG-PIPELINE] Step {i+1}/{len(operations)}: {op.type}")
+                        
+                        output_path = None
+                        
+                        if op.type == "upscale":
+                            params = op.params or {}
+                            output_path = tb_proc.tb_upscale_video(
+                                video_path=current_video_path,
+                                model_key=params.get("model", "RealESRGAN_x2plus"),
+                                output_scale_factor_ui=params.get("scale_factor", 2.0),
+                                tile_size=params.get("tile_size", 512),
+                                enhance_face=params.get("enhance_face", False),
+                                denoise_strength_ui=params.get("denoise_strength", 0.5),
+                                use_streaming=params.get("use_streaming", True)
+                            )
+                        
+                        elif op.type == "interpolate":
+                            params = op.params or {}
+                            output_path = tb_proc.tb_process_frames(
+                                video_path=current_video_path,
+                                target_fps_mode=params.get("fps_mode", "2x"),
+                                speed_factor=params.get("speed_factor", 1.0),
+                                use_streaming=params.get("use_streaming", True)
+                            )
+                        
+                        elif op.type == "filters":
+                            params = op.params or {}
+                            output_path = tb_proc.tb_apply_filters(
+                                video_path=current_video_path,
+                                brightness=params.get("brightness", 0.0),
+                                contrast=params.get("contrast", 1.0),
+                                saturation=params.get("saturation", 1.0),
+                                temperature=params.get("temperature", 0.0),
+                                sharpen=params.get("sharpen", 0.0),
+                                blur=params.get("blur", 0.0),
+                                denoise=params.get("denoise", 0.0),
+                                vignette=params.get("vignette", 0.0),
+                                s_curve_contrast=params.get("s_curve_contrast", 0.0),
+                                film_grain_strength=params.get("film_grain", 0.0)
+                            )
+                        
+                        elif op.type == "loop":
+                            params = op.params or {}
+                            output_path = tb_proc.tb_create_loop(
+                                video_path=current_video_path,
+                                loop_type=params.get("loop_type", "loop"),
+                                num_loops=params.get("num_loops", 2)
+                            )
+                        
+                        elif op.type == "export":
+                            params = op.params or {}
+                            output_path = tb_proc.tb_export_video(
+                                video_path=current_video_path,
+                                export_format=params.get("format", "MP4"),
+                                quality_slider=params.get("quality", 85),
+                                max_width=params.get("max_width") or 1920,
+                                output_base_name_override=params.get("output_name")
+                            )
+                        
+                        # Check result
+                        if output_path is None or not os.path.exists(output_path):
+                            results.append({"step": i+1, "type": op.type, "success": False, "message": "Operation failed"})
+                            raise Exception(f"Pipeline step {i+1} ({op.type}) failed - no output")
+                        
+                        results.append({"step": i+1, "type": op.type, "success": True, "message": "Operation completed"})
+                        
+                        # Track intermediate files for cleanup
+                        if current_video_path != input_path and current_video_path != output_path:
+                            intermediate_files.append(current_video_path)
+                        
+                        current_video_path = output_path
+                        logger.info(f"[BG-PIPELINE] Step {i+1} complete: {output_path}")
+                    
+                    return current_video_path
+                    
+                finally:
+                    # Clean up intermediate files
+                    for path in intermediate_files:
+                        if os.path.exists(path):
+                            try:
+                                os.remove(path)
+                                logger.debug(f"[BG-PIPELINE] Cleaned up intermediate: {path}")
+                            except Exception as e:
+                                logger.warning(f"[BG-PIPELINE] Cleanup failed: {e}")
+                    
+                    # Clean up input if from base64
+                    if has_b64 and input_path and os.path.exists(input_path):
+                        try:
+                            os.remove(input_path)
+                            logger.debug(f"[BG-PIPELINE] Cleaned up input: {input_path}")
+                        except Exception as e:
+                            logger.warning(f"[BG-PIPELINE] Input cleanup failed: {e}")
+            
+            # Submit to background executor
+            run_postprocess_in_background(
+                operation_name="pipeline",
+                callback_url=req.callback_url,
+                process_func=run_pipeline_operations,
+                cleanup_func=None,  # Cleanup handled inside the function
+                input_path=temp_video_path,
+                operations=req.operations,
+                tb_proc=tb_processor,
+                has_b64=has_base64,
+                metadata={
+                    "operations_count": len(req.operations),
+                    "operations": [{"type": op.type, "params": op.params} for op in req.operations]
+                }
+            )
+            
+            # Return immediately - no timeout!
+            return AsyncProcessingResponse(
+                success=True,
+                message=f"Pipeline with {len(req.operations)} operations started in background",
+                processing=True,
+                callback_url=req.callback_url,
+                note="Results will be sent to your callback URL when all operations complete. This may take 10+ minutes for complex pipelines."
+            )
+        
+        # ================================================================
+        # SYNCHRONOUS MODE: No callback URL - process and return directly
+        # (WARNING: May timeout for long pipelines!)
+        # ================================================================
+        logger.info("[POST-PROCESS] No callback URL - running pipeline in SYNCHRONOUS mode (may timeout!)")
+        logger.warning("[POST-PROCESS] Pipeline without callback_url may timeout! Consider providing callback_url.")
+        
+        current_video_path = temp_video_path
+        intermediate_files = []
+        results = []
         
         # Execute each operation in sequence
         for i, op in enumerate(req.operations):
@@ -2724,21 +3025,6 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
         with open(current_video_path, 'rb') as f:
             output_base64 = base64.b64encode(f.read()).decode('utf-8')
         
-        # Send callback if URL provided
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation_type="pipeline",
-                success=True,
-                output_path=current_video_path,
-                output_base64=output_base64,
-                metadata={
-                    "operations_count": len(req.operations),
-                    "operations_completed": results,
-                    "message": f"Pipeline completed successfully ({len(req.operations)} operations)"
-                }
-            )
-        
         return PipelineResponse(
             success=True,
             message=f"Pipeline completed successfully ({len(req.operations)} operations)",
@@ -2753,39 +3039,26 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
         error_msg = f"Pipeline failed: {str(e)}"
         logger.error(f"[POST-PROCESS] {error_msg}")
         logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
-        
-        # Send error callback if URL provided
-        if req.callback_url:
-            await send_postprocess_callback(
-                callback_url=req.callback_url,
-                operation_type="pipeline",
-                success=False,
-                error=error_msg,
-                metadata={
-                    "operations_completed": results,
-                    "message": "Pipeline failed"
-                }
-            )
-        
         raise HTTPException(status_code=500, detail=error_msg)
     
     finally:
-        # Clean up temp input file
-        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
-            try:
-                os.remove(temp_video_path)
-                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
-            except Exception as e:
-                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
-        
-        # Clean up intermediate files
-        for path in intermediate_files:
-            if os.path.exists(path):
+        # Clean up temp input file (only if synchronous mode)
+        if not req.callback_url:
+            if temp_video_path and has_base64 and os.path.exists(temp_video_path):
                 try:
-                    os.remove(path)
-                    logger.debug(f"[POST-PROCESS] Cleaned up intermediate file: {path}")
+                    os.remove(temp_video_path)
+                    logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
                 except Exception as e:
-                    logger.warning(f"[POST-PROCESS] Failed to clean up intermediate file: {e}")
+                    logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+            
+            # Clean up intermediate files
+            for path in intermediate_files if 'intermediate_files' in dir() else []:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        logger.debug(f"[POST-PROCESS] Cleaned up intermediate file: {path}")
+                    except Exception as e:
+                        logger.warning(f"[POST-PROCESS] Failed to clean up intermediate file: {e}")
 
 
 # ============================================================================

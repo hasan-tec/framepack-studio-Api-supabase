@@ -152,6 +152,75 @@ The following endpoints support `callback_url`:
 
 ---
 
+## Async Background Processing Mode (Prevents Timeouts)
+
+**⚠️ IMPORTANT FOR PRODUCTION:** When using a reverse proxy like Cloudflare, Nginx, or RunPod's proxy, you may encounter **Error 524 (timeout)** for long-running operations. This happens because proxies typically timeout after 60-100 seconds, while video processing can take 5-30+ minutes.
+
+### Solution: Use Callback URL
+
+When you provide a `callback_url`, the API switches to **async background processing mode**:
+
+1. **Immediate Response**: API returns immediately (within seconds) with a "processing started" message
+2. **Background Processing**: The operation runs in a background thread
+3. **Callback Delivery**: Results are sent to your callback URL when complete
+
+### Async Response Format
+
+When `callback_url` is provided, you'll receive an immediate response like this:
+
+```json
+{
+  "success": true,
+  "message": "Upscale processing started in background",
+  "processing": true,
+  "callback_url": "https://myapp.com/webhooks/video-processed",
+  "note": "Results will be sent to your callback URL when processing completes. This may take several minutes for large videos."
+}
+```
+
+### Which Endpoints Support Async Mode?
+
+The following long-running endpoints support async background processing when `callback_url` is provided:
+
+| Endpoint | Typical Duration | Async Recommended |
+|----------|------------------|-------------------|
+| `/postprocess/upscale` | 3-30 minutes | ✅ **Highly Recommended** |
+| `/postprocess/interpolate` | 2-20 minutes | ✅ **Highly Recommended** |
+| `/postprocess/pipeline` | 5-60+ minutes | ✅ **Required for pipelines** |
+| `/postprocess/filters` | 30s-5 minutes | Optional |
+| `/postprocess/loop` | 30s-2 minutes | Optional |
+| `/postprocess/export` | 30s-5 minutes | Optional |
+| `/postprocess/join` | 30s-5 minutes | Optional |
+
+### Best Practices for Production
+
+1. **Always provide `callback_url`** for upscale, interpolate, and pipeline operations
+2. **Implement a webhook endpoint** in your application to receive results
+3. **Store job IDs** to correlate requests with callbacks
+4. **Handle both success and failure callbacks** appropriately
+
+### Example: Proper Production Usage
+
+```bash
+# This will NOT timeout - returns immediately, sends results to callback
+curl -X POST "http://your-api.com/postprocess/upscale" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_url": "https://example.com/video.mp4",
+    "model": "RealESRGAN_x4plus",
+    "scale_factor": 2.0,
+    "callback_url": "https://myapp.com/webhooks/video-processed"
+  }'
+
+# Immediate response:
+# {"success": true, "processing": true, "message": "Upscale processing started in background", ...}
+
+# Later, your callback URL receives the full result with the processed video
+```
+
+---
+
 # Phase 1: AI Features
 
 ## POST `/enhance-prompt`

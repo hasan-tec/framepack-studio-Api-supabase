@@ -2728,14 +2728,14 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
         if req.callback_url:
             await send_postprocess_callback(
                 callback_url=req.callback_url,
-                operation="pipeline",
+                operation_type="pipeline",
                 success=True,
                 output_path=current_video_path,
-                output_video_base64=output_base64,
-                message=f"Pipeline completed successfully ({len(req.operations)} operations)",
+                output_base64=output_base64,
                 metadata={
                     "operations_count": len(req.operations),
-                    "operations_completed": results
+                    "operations_completed": results,
+                    "message": f"Pipeline completed successfully ({len(req.operations)} operations)"
                 }
             )
         
@@ -2758,12 +2758,12 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
         if req.callback_url:
             await send_postprocess_callback(
                 callback_url=req.callback_url,
-                operation="pipeline",
+                operation_type="pipeline",
                 success=False,
                 error=error_msg,
-                message="Pipeline failed",
                 metadata={
-                    "operations_completed": results
+                    "operations_completed": results,
+                    "message": "Pipeline failed"
                 }
             )
         
@@ -4922,12 +4922,16 @@ async def send_job_callback(job_id: str, job: Any, base_url: str = "http://local
 
 async def send_postprocess_callback(
     callback_url: str,
-    operation_type: str,
-    success: bool,
+    operation_type: str = None,
+    success: bool = True,
     output_path: Optional[str] = None,
     output_base64: Optional[str] = None,
     error: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    # Alternative parameter names for backward compatibility
+    operation: str = None,
+    output_video_base64: Optional[str] = None,
+    message: Optional[str] = None
 ):
     """
     Send a callback/webhook POST request when a post-processing operation completes.
@@ -4935,14 +4939,31 @@ async def send_postprocess_callback(
     
     Args:
         callback_url: URL to POST results to
-        operation_type: Type of operation (upscale, interpolate, filters, etc.)
+        operation_type: Type of operation (upscale, interpolate, filters, etc.) - also accepts 'operation' alias
         success: Whether the operation succeeded
         output_path: Local path to the output file
-        output_base64: Base64-encoded output (optional, can be large)
+        output_base64: Base64-encoded output (optional, can be large) - also accepts 'output_video_base64' alias
         error: Error message if operation failed
         metadata: Additional operation-specific metadata
+        message: Optional message (will be added to metadata if provided)
     """
+    # Handle alternative parameter names for backward compatibility
+    if operation_type is None and operation is not None:
+        operation_type = operation
+    if output_base64 is None and output_video_base64 is not None:
+        output_base64 = output_video_base64
+    
+    # Add message to metadata if provided
+    if message is not None:
+        if metadata is None:
+            metadata = {}
+        metadata["message"] = message
+    
     if not callback_url:
+        return
+    
+    if not operation_type:
+        logger.error("[CALLBACK] Cannot send callback without operation_type")
         return
     
     logger.info(f"[CALLBACK] Sending post-process callback for '{operation_type}' to {callback_url}")

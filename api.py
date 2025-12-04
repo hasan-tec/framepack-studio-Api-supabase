@@ -882,6 +882,86 @@ class BatchProcessingResponse(BaseModel):
     failed: int
     results: List[BatchVideoResult]
 
+# --- Batch Generation Request/Response Models ---
+class BatchGenerationItem(BaseModel):
+    """A single generation job in a batch"""
+    # Image input - at least one required for I2V, none for T2V
+    input_image_base64: Optional[str] = Field(default=None, description="Base64 encoded input image")
+    input_image_url: Optional[str] = Field(default=None, description="URL to download input image")
+    
+    # Optional per-job overrides
+    prompt: Optional[str] = Field(default=None, description="Override prompt for this job")
+    seed: Optional[int] = Field(default=None, description="Override seed for this job (-1 for random)")
+    end_frame_image_base64: Optional[str] = Field(default=None, description="End frame for this job")
+
+class BatchGenerationRequest(BaseModel):
+    """Request model for batch video generation"""
+    jobs: List[BatchGenerationItem] = Field(
+        ...,
+        min_items=1,
+        max_items=50,
+        description="List of generation jobs (max 50)"
+    )
+    
+    # Shared parameters applied to all jobs (can be overridden per-job)
+    prompt: str = Field(..., description="Default prompt for all jobs")
+    negative_prompt: str = Field(
+        default="low quality, worst quality, deformed, distorted, disfigured, blurry, bad anatomy",
+        description="Negative prompt"
+    )
+    model_type: ModelType = Field(default=ModelType.ORIGINAL, description="Model type for all jobs")
+    
+    # Generation specs
+    steps: int = Field(default=25, ge=1, le=100, description="Diffusion steps")
+    total_second_length: float = Field(default=6.0, ge=1.0, le=120.0, description="Video length in seconds")
+    cfg: float = Field(default=1.0, ge=1.0, le=3.0, description="CFG Scale")
+    gs: float = Field(default=10.0, ge=1.0, le=32.0, description="Distilled CFG Scale")
+    
+    # Resolution
+    resolution_w: int = Field(default=640, ge=128, le=1920, description="Video width")
+    resolution_h: int = Field(default=640, ge=128, le=1920, description="Video height")
+    
+    # Latent settings
+    latent_type: LatentType = Field(default=LatentType.BLACK, description="Latent type for T2V")
+    latent_window_size: int = Field(default=9, ge=1, le=33, description="Latent window size")
+    
+    # Cache settings
+    cache_type: CacheType = Field(default=CacheType.MAGCACHE, description="Caching strategy")
+    
+    # Seed handling
+    randomize_seed: bool = Field(default=True, description="Randomize seed for each job")
+    base_seed: int = Field(default=-1, description="Base seed (-1 for random). If randomize_seed=False, all jobs use this seed")
+    
+    # LoRA
+    loras: Optional[Dict[str, float]] = Field(default=None, description="LoRA weights")
+    
+    # Callback
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="Webhook URL - receives notification when ALL jobs complete"
+    )
+    callback_token: Optional[str] = Field(default=None, description="Bearer token for callback")
+    per_job_callback: bool = Field(
+        default=False,
+        description="If true, callback is sent after EACH job completes, not just at the end"
+    )
+
+class BatchGenerationJobResult(BaseModel):
+    """Result for a single job in batch generation"""
+    index: int
+    job_id: str
+    seed: int
+    status: str
+    input_source: str
+
+class BatchGenerationResponse(BaseModel):
+    """Response after submitting batch generation"""
+    success: bool
+    message: str
+    total_jobs: int
+    job_ids: List[str]
+    results: List[BatchGenerationJobResult]
+
 # --- Video Save Request/Response Models ---
 class SaveVideoRequest(BaseModel):
     """Request model for saving a video to permanent storage"""
@@ -1130,97 +1210,6 @@ class GenerationResponse(BaseModel):
     resolution: Dict[str, int]
     estimated_time_seconds: Optional[float] = None
     message: str
-
-
-# --- Batch Generation Request/Response Models ---
-class BatchGenerationItem(BaseModel):
-    """A single item in a batch generation request"""
-    input_image_base64: Optional[str] = Field(
-        default=None,
-        description="Base64 encoded input image for this job"
-    )
-    input_image_url: Optional[str] = Field(
-        default=None,
-        description="URL to download input image from for this job"
-    )
-    prompt: Optional[str] = Field(
-        default=None,
-        description="Override prompt for this specific job (optional)"
-    )
-    seed: Optional[int] = Field(
-        default=None,
-        description="Override seed for this specific job (optional, -1 for random)"
-    )
-    end_frame_image_base64: Optional[str] = Field(
-        default=None,
-        description="Base64 encoded end frame image for this job (optional)"
-    )
-
-class BatchGenerationRequest(BaseModel):
-    """Request model for batch video generation - submit multiple jobs at once"""
-    
-    # List of items to process
-    items: List[BatchGenerationItem] = Field(
-        ...,
-        min_items=1,
-        max_items=50,
-        description="List of items to generate (each needs an image, max 50)"
-    )
-    
-    # Shared parameters applied to all jobs
-    prompt: str = Field(
-        ...,
-        description="Default prompt for all jobs (can be overridden per item)"
-    )
-    negative_prompt: str = Field(
-        default="low quality, worst quality, deformed, distorted, disfigured, blurry, bad anatomy",
-        description="Negative prompt for all jobs"
-    )
-    model_type: ModelType = Field(
-        default=ModelType.ORIGINAL,
-        description="Model type for all jobs"
-    )
-    steps: int = Field(default=25, ge=1, le=100, description="Steps for all jobs")
-    total_second_length: float = Field(default=6.0, ge=1.0, le=120.0, description="Video length for all jobs")
-    resolution_w: int = Field(default=640, description="Width for all jobs")
-    resolution_h: int = Field(default=640, description="Height for all jobs")
-    cfg_scale: float = Field(default=1.0, ge=0.0, le=20.0, description="CFG scale for all jobs")
-    distilled_cfg_scale: float = Field(default=10.0, ge=0.0, le=20.0, description="Distilled CFG for all jobs")
-    
-    # Seed handling
-    randomize_seed: bool = Field(
-        default=True,
-        description="If true, generate random seeds for each job. If false, use base_seed + index."
-    )
-    base_seed: int = Field(
-        default=-1,
-        description="Base seed (used when randomize_seed=false, or as first seed when true)"
-    )
-    
-    # LoRA settings (shared)
-    lora_name: Optional[str] = Field(default=None, description="LoRA to use for all jobs")
-    lora_strength: float = Field(default=1.0, ge=0.0, le=2.0, description="LoRA strength")
-    
-    # Callback
-    callback_url: Optional[str] = Field(
-        default=None,
-        description="URL to POST results when ALL jobs complete (batch callback)"
-    )
-
-class BatchGenerationJobInfo(BaseModel):
-    """Info about a single job in the batch response"""
-    index: int
-    job_id: str
-    status: str
-    seed: int
-    input_source: str
-
-class BatchGenerationResponse(BaseModel):
-    """Response after submitting a batch generation request"""
-    success: bool
-    message: str
-    total_jobs: int
-    jobs: List[BatchGenerationJobInfo]
 
 
 class JobStatusResponse(BaseModel):
@@ -5147,27 +5136,42 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
 
 
 @app.post("/generate/batch", response_model=BatchGenerationResponse, tags=["Generation"])
-async def batch_generate(req: BatchGenerationRequest, x_api_key: str = Header(None)):
+async def batch_generate_videos(req: BatchGenerationRequest, x_api_key: str = Header(None)):
     """
-    Submit multiple video generation jobs at once (batch processing).
+    Submit multiple video generation jobs in a single request.
     
-    This is equivalent to Gradio's "Add Batch to Queue" button.
-    Each item in the batch uses the shared parameters, with optional per-item overrides.
+    This is similar to Gradio's "Add Batch to Queue" functionality.
     
-    Features:
-    - Submit up to 50 jobs at once
-    - Shared parameters (prompt, steps, model, etc.) apply to all jobs
-    - Per-item overrides for prompt, seed, and input image
-    - Automatic seed randomization option
-    - All jobs are added to the same queue as single /generate calls
+    Each job in the batch can have:
+    - Its own input image (base64 or URL)
+    - Optional prompt override
+    - Optional seed override
+    - Optional end frame
     
-    Use /queue to monitor all jobs, or /status/{job_id} for individual job status.
+    Shared parameters (prompt, steps, model_type, etc.) are applied to all jobs
+    unless overridden per-job.
+    
+    Seed handling:
+    - If randomize_seed=True (default): Each job gets a unique random seed
+    - If randomize_seed=False: All jobs use base_seed
+    
+    Callback options:
+    - callback_url: Webhook URL for notifications
+    - per_job_callback=False (default): Single callback when ALL jobs complete
+    - per_job_callback=True: Callback after EACH job completes
+    
+    Returns immediately with all job_ids for status polling.
     """
     validate_api_key(x_api_key)
     
-    logger.info(f"[BATCH-GEN] Batch generation request: {len(req.items)} items, model={req.model_type}")
+    logger.info(f"[BATCH-GEN] Batch generation request: {len(req.jobs)} jobs, model={req.model_type.value}")
+    logger.info(f"[BATCH-GEN] Shared prompt: {req.prompt[:50]}...")
+    logger.info(f"[BATCH-GEN] Randomize seed: {req.randomize_seed}, Base seed: {req.base_seed}")
+    logger.info(f"[BATCH-GEN] Callback URL: {req.callback_url[:50] + '...' if req.callback_url and len(req.callback_url) > 50 else req.callback_url}")
+    logger.info(f"[BATCH-GEN] Per-job callback: {req.per_job_callback}")
     
-    jobs_info = []
+    results = []
+    job_ids = []
     
     # Determine starting seed
     if req.base_seed == -1:
@@ -5175,85 +5179,120 @@ async def batch_generate(req: BatchGenerationRequest, x_api_key: str = Header(No
     else:
         current_seed = req.base_seed
     
-    # Calculate estimated bucket resolution (shared for all jobs)
+    # Estimated bucket resolution
     estimated_bucket_h, estimated_bucket_w = apply_bucket_resolution(req.resolution_w, req.resolution_h)
-    logger.info(f"[BATCH-GEN] Shared resolution: {req.resolution_w}x{req.resolution_h} -> bucket: {estimated_bucket_w}x{estimated_bucket_h}")
     
-    for i, item in enumerate(req.items):
-        try:
-            logger.info(f"[BATCH-GEN] Processing item {i+1}/{len(req.items)}")
+    try:
+        for i, job_item in enumerate(req.jobs):
+            logger.info(f"[BATCH-GEN] Processing job {i+1}/{len(req.jobs)}")
             
             # Determine seed for this job
-            if item.seed is not None:
-                job_seed = item.seed if item.seed != -1 else random.randint(0, 2**31 - 1)
+            if job_item.seed is not None:
+                job_seed = job_item.seed if job_item.seed != -1 else random.randint(0, 2**31 - 1)
+            elif req.randomize_seed:
+                job_seed = random.randint(0, 2**31 - 1)
             else:
                 job_seed = current_seed
             
             # Determine prompt for this job
-            job_prompt = item.prompt if item.prompt else req.prompt
+            job_prompt = job_item.prompt if job_item.prompt else req.prompt
             
             # Process input image
             input_image = None
             has_input_image = False
             input_source = "none"
             
-            if item.input_image_base64:
-                input_image = decode_base64_image(item.input_image_base64)
-                has_input_image = True
-                input_source = "base64"
-                logger.info(f"[BATCH-GEN] Item {i}: Decoded base64 image: {input_image.shape}")
-            elif item.input_image_url:
-                input_image = await download_image_from_url(item.input_image_url)
-                has_input_image = True
-                input_source = item.input_image_url[:50]
-                logger.info(f"[BATCH-GEN] Item {i}: Downloaded image from URL")
+            if job_item.input_image_base64:
+                try:
+                    input_image = decode_base64_image(job_item.input_image_base64)
+                    has_input_image = True
+                    input_source = "base64"
+                    logger.info(f"[BATCH-GEN] Job {i+1}: Decoded base64 image: {input_image.shape}")
+                except Exception as e:
+                    logger.error(f"[BATCH-GEN] Job {i+1}: Failed to decode base64 image: {e}")
+                    results.append(BatchGenerationJobResult(
+                        index=i,
+                        job_id="",
+                        seed=job_seed,
+                        status="failed",
+                        input_source="base64_error"
+                    ))
+                    continue
+            elif job_item.input_image_url:
+                try:
+                    input_image = await download_image_from_url(job_item.input_image_url)
+                    has_input_image = True
+                    input_source = job_item.input_image_url[:50]
+                    logger.info(f"[BATCH-GEN] Job {i+1}: Downloaded image from URL: {input_image.shape}")
+                except Exception as e:
+                    logger.error(f"[BATCH-GEN] Job {i+1}: Failed to download image: {e}")
+                    results.append(BatchGenerationJobResult(
+                        index=i,
+                        job_id="",
+                        seed=job_seed,
+                        status="failed",
+                        input_source="url_error"
+                    ))
+                    continue
             
-            # If no input image, create latent background
+            # If no input image, create latent for T2V
             if input_image is None:
-                input_image = create_latent_image(req.resolution_w, req.resolution_h, LatentType.BLACK)
-                logger.info(f"[BATCH-GEN] Item {i}: Created latent image for T2V")
-                input_source = "latent"
+                input_image = create_latent_image(req.resolution_w, req.resolution_h, req.latent_type)
+                input_source = f"latent_{req.latent_type.value}"
+                logger.info(f"[BATCH-GEN] Job {i+1}: Created {req.latent_type.value} latent image")
             
             # Process end frame if provided
             end_frame_image = None
-            if item.end_frame_image_base64:
-                end_frame_image = decode_base64_image(item.end_frame_image_base64)
-                logger.info(f"[BATCH-GEN] Item {i}: Decoded end frame image")
+            if job_item.end_frame_image_base64:
+                try:
+                    end_frame_image = decode_base64_image(job_item.end_frame_image_base64)
+                    logger.info(f"[BATCH-GEN] Job {i+1}: Decoded end frame: {end_frame_image.shape}")
+                except Exception as e:
+                    logger.warning(f"[BATCH-GEN] Job {i+1}: Failed to decode end frame: {e}")
             
-            # Process LoRA
+            # Process LoRA selection
             selected_loras = []
             lora_values_list = []
-            if req.lora_name and req.lora_name in lora_names:
-                selected_loras.append(req.lora_name)
-                lora_values_list.append(req.lora_strength)
+            if req.loras:
+                for lora_name, weight in req.loras.items():
+                    if lora_name in lora_names:
+                        selected_loras.append(lora_name)
+                        lora_values_list.append(weight)
+            
+            # Determine cache settings
+            use_teacache = req.cache_type == CacheType.TEACACHE
+            use_magcache = req.cache_type == CacheType.MAGCACHE
+            
+            # Determine callback for this job
+            job_callback_url = req.callback_url if req.per_job_callback else None
             
             # Build job parameters
             job_params = {
                 'model_type': req.model_type.value,
                 'input_image': input_image.copy() if input_image is not None else None,
                 'has_input_image': has_input_image,
-                'latent_type': LatentType.BLACK.value,
+                'latent_type': req.latent_type.value,
                 'end_frame_image': end_frame_image.copy() if end_frame_image is not None else None,
                 'end_frame_strength': 1.0,
                 'prompt_text': job_prompt,
                 'n_prompt': req.negative_prompt,
                 'seed': job_seed,
                 'total_second_length': req.total_second_length,
-                'latent_window_size': 9,
+                'latent_window_size': req.latent_window_size,
                 'steps': req.steps,
-                'cfg': req.cfg_scale,
-                'gs': req.distilled_cfg_scale,
+                'cfg': req.cfg,
+                'gs': req.gs,
                 'rs': 0.0,
                 'resolutionW': req.resolution_w,
                 'resolutionH': req.resolution_h,
-                'use_teacache': False,
-                'teacache_num_steps': 5,
+                'use_teacache': use_teacache,
+                'teacache_num_steps': 25,
                 'teacache_rel_l1_thresh': 0.15,
-                'use_magcache': False,
-                'magcache_threshold': 0.0,
-                'magcache_max_consecutive_skips': 50,
-                'magcache_retention_ratio': 0.5,
-                'blend_sections': False,
+                'use_magcache': use_magcache,
+                'magcache_threshold': 0.1,
+                'magcache_max_consecutive_skips': 2,
+                'magcache_retention_ratio': 0.25,
+                'blend_sections': 4,
                 'selected_loras': selected_loras,
                 'lora_values': lora_values_list,
                 'lora_loaded_names': lora_names,
@@ -5264,62 +5303,60 @@ async def batch_generate(req: BatchGenerationRequest, x_api_key: str = Header(No
                 'end_frame_image_path': None,
                 'input_video': None,
                 'combine_with_source': False,
-                'num_cleaned_frames': 24,
+                'num_cleaned_frames': 5,
                 'save_metadata_checked': True,
-                'callback_url': req.callback_url,  # All jobs share the same callback
-                'callback_token': None,
-                'batch_index': i,  # Track which item in batch this is
-                'batch_total': len(req.items),
+                'callback_url': job_callback_url,
+                'callback_token': req.callback_token if req.per_job_callback else None,
+                # Batch metadata for callback
+                'batch_info': {
+                    'batch_index': i,
+                    'batch_total': len(req.jobs),
+                    'batch_callback_url': req.callback_url,
+                    'batch_callback_token': req.callback_token,
+                    'is_last_job': i == len(req.jobs) - 1
+                }
             }
             
             # Add to queue
             job_id = job_queue.add_job(job_params)
-            logger.info(f"[BATCH-GEN] Item {i}: Job {job_id} added with seed {job_seed}")
+            job_ids.append(job_id)
+            
+            logger.info(f"[BATCH-GEN] Job {i+1}: Added to queue with ID {job_id}, seed {job_seed}")
             
             # Initialize progress tracking
             with progress_lock:
                 job_progress_store[job_id] = {
                     "progress_percent": 0,
-                    "progress_desc": "Queued (batch)",
+                    "progress_desc": "Queued",
                     "updated_at": time.time()
                 }
             
-            jobs_info.append(BatchGenerationJobInfo(
+            results.append(BatchGenerationJobResult(
                 index=i,
                 job_id=job_id,
-                status="pending",
                 seed=job_seed,
+                status="pending",
                 input_source=input_source
             ))
-            
-            # Update seed for next job
-            if req.randomize_seed:
-                current_seed = random.randint(0, 2**31 - 1)
-            else:
-                current_seed += 1
-                
-        except Exception as e:
-            logger.error(f"[BATCH-GEN] Error processing item {i}: {e}")
-            logger.error(f"[BATCH-GEN] Traceback: {traceback.format_exc()}")
-            # Continue with next item instead of failing entire batch
-            jobs_info.append(BatchGenerationJobInfo(
-                index=i,
-                job_id="error",
-                status="failed",
-                seed=0,
-                input_source=f"error: {str(e)[:50]}"
-            ))
-    
-    successful_jobs = [j for j in jobs_info if j.status != "failed"]
-    
-    logger.info(f"[BATCH-GEN] Batch complete: {len(successful_jobs)}/{len(req.items)} jobs queued")
-    
-    return BatchGenerationResponse(
-        success=len(successful_jobs) > 0,
-        message=f"Batch queued: {len(successful_jobs)}/{len(req.items)} jobs added successfully",
-        total_jobs=len(jobs_info),
-        jobs=jobs_info
-    )
+        
+        # If not per-job callback and callback_url provided, we need to track batch completion
+        # The worker will handle sending the final batch callback based on batch_info
+        
+        logger.info(f"[BATCH-GEN] Batch complete: {len(job_ids)} jobs added to queue")
+        
+        return BatchGenerationResponse(
+            success=True,
+            message=f"Successfully queued {len(job_ids)} generation jobs",
+            total_jobs=len(req.jobs),
+            job_ids=job_ids,
+            results=results
+        )
+        
+    except Exception as e:
+        error_msg = f"Batch generation failed: {str(e)}"
+        logger.error(f"[BATCH-GEN] {error_msg}")
+        logger.error(f"[BATCH-GEN] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Generation"])
@@ -5607,83 +5644,135 @@ async def send_job_callback(job_id: str, job: Any, base_url: str = "http://local
     """
     Send a callback/webhook POST request when a job completes.
     This notifies external services (like Supabase Edge Functions) about job completion.
+    
+    Also handles batch completion callbacks when a job is part of a batch and
+    is the last job to complete.
     """
     callback_url = job.params.get('callback_url')
-    if not callback_url:
-        logger.debug(f"No callback_url for job {job_id}, skipping callback")
-        return
+    batch_info = job.params.get('batch_info')
     
-    logger.info(f"Sending callback for job {job_id} to {callback_url}")
+    # Build base payload for both per-job and batch callbacks
+    base_payload = {
+        "job_id": job_id,
+        "status": job.status.value,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+        "error": job.error,
+    }
     
-    try:
-        # Build callback payload
-        payload = {
-            "job_id": job_id,
-            "status": job.status.value,
-            "created_at": job.created_at,
-            "started_at": job.started_at,
-            "completed_at": job.completed_at,
-            "error": job.error,
-        }
+    # Add result info if job completed successfully
+    if job.status == JobStatus.COMPLETED and job.result:
+        filename = os.path.basename(job.result)
+        base_payload["result_url"] = f"/outputs/{filename}"
+        base_payload["video_download_url"] = f"{base_url}/outputs/{filename}"
+        base_payload["video_filename"] = filename
+        base_payload["video_local_path"] = job.result
         
-        # Add result info if job completed successfully
-        if job.status == JobStatus.COMPLETED and job.result:
-            filename = os.path.basename(job.result)
-            payload["result_url"] = f"/outputs/{filename}"
-            payload["video_download_url"] = f"{base_url}/outputs/{filename}"
-            payload["video_filename"] = filename
-            payload["video_local_path"] = job.result
+        # Add file size if available
+        try:
+            base_payload["video_file_size"] = os.path.getsize(job.result)
+        except:
+            pass
+    
+    # Add generation metadata
+    base_payload["metadata"] = {
+        "model_type": job.params.get('model_type'),
+        "prompt": job.params.get('prompt_text'),
+        "negative_prompt": job.params.get('n_prompt'),
+        "seed": job.params.get('seed'),
+        "steps": job.params.get('steps'),
+        "cfg": job.params.get('cfg'),
+        "gs": job.params.get('gs'),
+        "resolution_w": job.params.get('resolutionW'),
+        "resolution_h": job.params.get('resolutionH'),
+        "total_second_length": job.params.get('total_second_length'),
+    }
+    
+    # Add batch info to metadata if present
+    if batch_info:
+        base_payload["metadata"]["batch_index"] = batch_info.get('batch_index')
+        base_payload["metadata"]["batch_total"] = batch_info.get('batch_total')
+    
+    # 1. Send per-job callback if callback_url is set
+    if callback_url:
+        logger.info(f"[CALLBACK] Sending per-job callback for job {job_id} to {callback_url}")
+        
+        try:
+            payload = base_payload.copy()
+            payload["type"] = "generation"
             
-            # Add file size if available
-            try:
-                payload["video_file_size"] = os.path.getsize(job.result)
-            except:
-                pass
+            headers = {
+                "Content-Type": "application/json",
+                "X-Job-ID": job_id,
+            }
+            
+            callback_token = job.params.get('callback_token')
+            if callback_token:
+                headers["Authorization"] = f"Bearer {callback_token}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    callback_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response_text = await response.text()
+                    if response.status >= 200 and response.status < 300:
+                        logger.info(f"[CALLBACK] Per-job callback successful for job {job_id}: {response.status}")
+                    else:
+                        logger.warning(f"[CALLBACK] Per-job callback failed for job {job_id}: {response.status} - {response_text}")
+                        
+        except asyncio.TimeoutError:
+            logger.error(f"[CALLBACK] Per-job callback timeout for job {job_id} to {callback_url}")
+        except Exception as e:
+            logger.error(f"[CALLBACK] Per-job callback error for job {job_id}: {str(e)}")
+    else:
+        logger.debug(f"[CALLBACK] No callback_url for job {job_id}, skipping per-job callback")
+    
+    # 2. Handle batch completion callback (only when per_job_callback=False)
+    if batch_info and batch_info.get('batch_callback_url') and batch_info.get('is_last_job'):
+        batch_callback_url = batch_info.get('batch_callback_url')
+        batch_callback_token = batch_info.get('batch_callback_token')
         
-        # Add generation metadata
-        payload["metadata"] = {
-            "model_type": job.params.get('model_type'),
-            "prompt": job.params.get('prompt_text'),
-            "negative_prompt": job.params.get('n_prompt'),
-            "seed": job.params.get('seed'),
-            "steps": job.params.get('steps'),
-            "cfg": job.params.get('cfg'),
-            "gs": job.params.get('gs'),
-            "resolution_w": job.params.get('resolutionW'),
-            "resolution_h": job.params.get('resolutionH'),
-            "total_second_length": job.params.get('total_second_length'),
-        }
+        logger.info(f"[BATCH-CALLBACK] Last job in batch completed, sending batch completion callback to {batch_callback_url}")
         
-        # Prepare headers
-        headers = {
-            "Content-Type": "application/json",
-            "X-Job-ID": job_id,
-        }
-        
-        # Add authorization token if provided
-        callback_token = job.params.get('callback_token')
-        if callback_token:
-            headers["Authorization"] = f"Bearer {callback_token}"
-        
-        # Send the callback
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                callback_url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                response_text = await response.text()
-                if response.status >= 200 and response.status < 300:
-                    logger.info(f"Callback successful for job {job_id}: {response.status}")
-                    logger.debug(f"Callback response: {response_text}")
-                else:
-                    logger.warning(f"Callback failed for job {job_id}: {response.status} - {response_text}")
-                    
-    except asyncio.TimeoutError:
-        logger.error(f"Callback timeout for job {job_id} to {callback_url}")
-    except Exception as e:
-        logger.error(f"Callback error for job {job_id}: {str(e)}")
+        try:
+            batch_payload = {
+                "type": "batch_generation_complete",
+                "batch_total": batch_info.get('batch_total'),
+                "last_job_id": job_id,
+                "last_job_status": job.status.value,
+                "timestamp": datetime.now().isoformat(),
+                "last_job_result": base_payload,
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-Batch-Complete": "true",
+            }
+            
+            if batch_callback_token:
+                headers["Authorization"] = f"Bearer {batch_callback_token}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    batch_callback_url,
+                    json=batch_payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response_text = await response.text()
+                    if response.status >= 200 and response.status < 300:
+                        logger.info(f"[BATCH-CALLBACK] Batch completion callback successful: {response.status}")
+                    else:
+                        logger.warning(f"[BATCH-CALLBACK] Batch completion callback failed: {response.status} - {response_text}")
+                        
+        except asyncio.TimeoutError:
+            logger.error(f"[BATCH-CALLBACK] Batch completion callback timeout to {batch_callback_url}")
+        except Exception as e:
+            logger.error(f"[BATCH-CALLBACK] Batch completion callback error: {str(e)}")
 
 
 async def send_postprocess_callback(

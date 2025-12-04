@@ -2820,20 +2820,31 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                 try:
                     for i, op in enumerate(operations):
                         logger.info(f"[BG-PIPELINE] Step {i+1}/{len(operations)}: {op.type}")
+                        logger.info(f"[BG-PIPELINE] Step {i+1} params: {op.params}")
                         
                         output_path = None
                         
                         if op.type == "upscale":
                             params = op.params or {}
+                            # Force streaming mode and reasonable tile size to prevent OOM
+                            tile_size = params.get("tile_size", 512)
+                            if tile_size == 0:
+                                tile_size = 512  # Use 512 instead of 0 (which means no tiling)
+                                logger.info(f"[BG-PIPELINE] tile_size was 0, using 512 to prevent OOM")
+                            use_streaming = params.get("use_streaming", True)  # Default to True for safety
+                            
+                            logger.info(f"[BG-PIPELINE] Starting upscale with model={params.get('model', 'RealESRGAN_x2plus')}, tile_size={tile_size}, streaming={use_streaming}")
+                            
                             output_path = tb_proc.tb_upscale_video(
                                 video_path=current_video_path,
                                 model_key=params.get("model", "RealESRGAN_x2plus"),
                                 output_scale_factor_ui=params.get("scale_factor", 2.0),
-                                tile_size=params.get("tile_size", 512),
+                                tile_size=tile_size,
                                 enhance_face=params.get("enhance_face", False),
                                 denoise_strength_ui=params.get("denoise_strength", 0.5),
-                                use_streaming=params.get("use_streaming", True)
+                                use_streaming=use_streaming
                             )
+                            logger.info(f"[BG-PIPELINE] Upscale returned: {output_path}")
                         
                         elif op.type == "interpolate":
                             params = op.params or {}
@@ -2880,8 +2891,10 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                         
                         # Check result
                         if output_path is None or not os.path.exists(output_path):
+                            error_msg = f"Pipeline step {i+1} ({op.type}) failed - no output produced"
+                            logger.error(f"[BG-PIPELINE] {error_msg}")
                             results.append({"step": i+1, "type": op.type, "success": False, "message": "Operation failed"})
-                            raise Exception(f"Pipeline step {i+1} ({op.type}) failed - no output")
+                            raise Exception(error_msg)
                         
                         results.append({"step": i+1, "type": op.type, "success": True, "message": "Operation completed"})
                         
@@ -2892,7 +2905,13 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                         current_video_path = output_path
                         logger.info(f"[BG-PIPELINE] Step {i+1} complete: {output_path}")
                     
+                    logger.info(f"[BG-PIPELINE] All steps complete, returning: {current_video_path}")
                     return current_video_path
+                
+                except Exception as e:
+                    logger.error(f"[BG-PIPELINE] Pipeline failed with error: {str(e)}")
+                    logger.error(f"[BG-PIPELINE] Traceback: {traceback.format_exc()}")
+                    raise
                     
                 finally:
                     # Clean up intermediate files

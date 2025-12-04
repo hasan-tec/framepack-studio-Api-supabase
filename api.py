@@ -1286,8 +1286,13 @@ def run_postprocess_in_background(
         callback_url: URL to send results to
         process_func: The function to run (should return output_path or None)
         cleanup_func: Optional cleanup function to run after processing
-        **kwargs: Arguments to pass to process_func
+        **kwargs: Arguments to pass to process_func (metadata is extracted and not passed)
     """
+    # Extract metadata before passing to process_func (it's for the callback, not the processor)
+    callback_metadata = kwargs.pop('metadata', {})
+    # Copy kwargs for the background thread (to avoid closure issues)
+    process_kwargs = dict(kwargs)
+    
     def background_task():
         output_path = None
         output_base64 = None
@@ -1296,8 +1301,8 @@ def run_postprocess_in_background(
         try:
             logger.info(f"[BG-TASK] Starting background {operation_name} processing...")
             
-            # Run the actual processing
-            output_path = process_func(**kwargs)
+            # Run the actual processing (metadata is NOT passed here)
+            output_path = process_func(**process_kwargs)
             
             if output_path and os.path.exists(output_path):
                 logger.info(f"[BG-TASK] {operation_name} complete: {output_path}")
@@ -1313,7 +1318,7 @@ def run_postprocess_in_background(
                     success=True,
                     output_path=output_path,
                     output_base64=output_base64,
-                    metadata=kwargs.get('metadata', {})
+                    metadata=callback_metadata
                 ))
             else:
                 error_msg = f"{operation_name} failed - no output produced"
@@ -3051,14 +3056,15 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                 except Exception as e:
                     logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
             
-            # Clean up intermediate files
-            for path in intermediate_files if 'intermediate_files' in dir() else []:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                        logger.debug(f"[POST-PROCESS] Cleaned up intermediate file: {path}")
-                    except Exception as e:
-                        logger.warning(f"[POST-PROCESS] Failed to clean up intermediate file: {e}")
+            # Clean up intermediate files (if they exist in local scope)
+            if 'intermediate_files' in locals():
+                for path in intermediate_files:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                            logger.debug(f"[POST-PROCESS] Cleaned up intermediate file: {path}")
+                        except Exception as e:
+                            logger.warning(f"[POST-PROCESS] Failed to clean up intermediate file: {e}")
 
 
 # ============================================================================

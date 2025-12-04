@@ -1067,7 +1067,9 @@ def worker(
                                 
                                 ffmpeg_cmd = [
                                     ffmpeg_exe, "-y", "-f", "concat", "-safe", "0",
-                                    "-i", temp_list_file, "-c", "copy", combined_output_filename
+                                    "-i", temp_list_file, "-c", "copy",
+                                    "-movflags", "+faststart",  # Enable web streaming
+                                    combined_output_filename
                                 ]
                                 print(f"Running ffmpeg command: {' '.join(ffmpeg_cmd)}")
                                 subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)

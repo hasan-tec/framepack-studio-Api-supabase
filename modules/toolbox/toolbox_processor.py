@@ -288,6 +288,62 @@ class VideoProcessor:
             if self.ffmpeg_source != "Bundled":
                  self.message_manager.add_warning("For full functionality, please run the 'setup_ffmpeg.py' script.")
 
+    def _tb_apply_faststart(self, video_path: str) -> str:
+        """
+        Applies -movflags +faststart to an existing MP4 file for web streaming compatibility.
+        This moves the moov atom to the beginning of the file, enabling progressive playback.
+        
+        Works by creating a temp file with faststart, then replacing the original.
+        Only affects MP4 files. Returns the path (original if successful, None if failed).
+        
+        Args:
+            video_path: Path to the MP4 file to process
+            
+        Returns:
+            The video path if successful, None if failed
+        """
+        if not self.has_ffmpeg or not video_path:
+            return video_path
+            
+        # Only process MP4 files
+        if not video_path.lower().endswith('.mp4'):
+            return video_path
+            
+        try:
+            temp_path = video_path.replace('.mp4', '_faststart_temp.mp4')
+            
+            ffmpeg_cmd = [
+                self.ffmpeg_exe, "-y", "-loglevel", "error",
+                "-i", video_path,
+                "-c", "copy",  # Stream copy, no re-encoding
+                "-movflags", "+faststart",
+                temp_path
+            ]
+            
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore')
+            
+            # Replace original with faststart version
+            if os.path.exists(temp_path):
+                os.replace(temp_path, video_path)
+                self.message_manager.add_message(f"Applied faststart for web streaming: {os.path.basename(video_path)}", "INFO")
+                return video_path
+            else:
+                self.message_manager.add_warning(f"Faststart temp file not created for {os.path.basename(video_path)}")
+                return video_path
+                
+        except subprocess.CalledProcessError as e:
+            self.message_manager.add_warning(f"Could not apply faststart to {os.path.basename(video_path)}: {e}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            return video_path  # Return original, it still works, just not optimized for streaming
+        except Exception as e:
+            self.message_manager.add_warning(f"Unexpected error applying faststart: {e}")
+            return video_path
+
     def tb_get_frames_from_folder(self, folder_name: str) -> list:
         """
         Gets a sorted list of image file paths from a given folder name.
@@ -630,6 +686,9 @@ class VideoProcessor:
             self.message_manager.add_message(f"Writing {len(frames_data)} frames to video: {output_video_path}")
             imageio.mimwrite(output_video_path, frames_data, fps=output_fps, quality=VIDEO_QUALITY, macro_block_size=None)
 
+            # Apply faststart for web streaming compatibility (imageio doesn't support this natively)
+            self._tb_apply_faststart(output_video_path)
+
             self.message_manager.add_success(f"Successfully reassembled {len(frames_data)} frames into: {output_video_path}")
             return output_video_path
 
@@ -750,9 +809,12 @@ class VideoProcessor:
         )
         
         # Set standard, high-compatibility encoding options.
+        # -movflags +faststart moves moov atom to start for web streaming
         ffmpeg_cmd.extend([
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k", output_path
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
         ])
 
         # --- 5. EXECUTE THE COMMAND ---
@@ -813,6 +875,7 @@ class VideoProcessor:
             self.message_manager.add_message(f"Exporting MP4 with CRF: {crf_value} (Quality: {quality_slider}%)")
             ffmpeg_cmd.extend(["-c:v", "libx264", "-crf", str(crf_value), "-preset", "medium"])
             ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "128k"]) # Keep audio, but compress it
+            ffmpeg_cmd.extend(["-movflags", "+faststart"]) # Enable web streaming - moov atom at start
             
         elif export_format == "WebM":
             # Similar to MP4, but for the VP9 codec. A good CRF range is ~35 (low) to 25 (high).
@@ -1338,6 +1401,8 @@ class VideoProcessor:
                 # Always re-encode audio to AAC for MP4 compatibility, even if no speed change,
                 # as original audio might not be AAC.
                 ffmpeg_mux_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                # Add movflags for web streaming compatibility
+                ffmpeg_mux_cmd.extend(["-movflags", "+faststart"])
                 ffmpeg_mux_cmd.extend(["-map", "0:v:0", "-map", "1:a:0?", "-shortest", final_muxed_output_path])
                 
                 try:
@@ -1353,6 +1418,8 @@ class VideoProcessor:
                 if os.path.exists(final_muxed_output_path) and final_muxed_output_path != video_stream_output_path:
                     os.remove(final_muxed_output_path)
                 os.rename(video_stream_output_path, final_muxed_output_path)
+                # Apply faststart for web streaming (imageio output doesn't have it)
+                self._tb_apply_faststart(final_muxed_output_path)
 
             if os.path.exists(video_stream_output_path) and video_stream_output_path != final_muxed_output_path:
                 try: os.remove(video_stream_output_path)
@@ -1479,6 +1546,9 @@ class VideoProcessor:
             progress(0.5, desc=f"Running FFmpeg for {loop_type}...")
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, errors='ignore')
 
+            # Apply faststart for web streaming (loop uses stream copy, so moov atom needs post-processing)
+            self._tb_apply_faststart(output_path)
+
             progress(1.0, desc=f"{loop_type.capitalize()} loop created successfully.")
             self.message_manager.add_success(f"Loop creation complete: {output_path}")
             return output_path
@@ -1598,6 +1668,8 @@ class VideoProcessor:
                 self.message_manager.add_message("No audio in original or detection issue. Filtered video will be silent.", "INFO")
                 ffmpeg_cmd.extend(["-an"])
             
+            # Enable web streaming - moov atom at start of file
+            ffmpeg_cmd.extend(["-movflags", "+faststart"])
             ffmpeg_cmd.append(output_path)
 
             self.message_manager.add_message("🔄 Processing with FFmpeg...")
@@ -1744,6 +1816,7 @@ class VideoProcessor:
                     self.ffmpeg_exe, "-y", "-loglevel", "error",
                     "-i", video_stream_output_path, "-i", resolved_video_path,
                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",  # Enable web streaming
                     "-map", "0:v:0", "-map", "1:a:0?", "-shortest", final_muxed_output_path
                 ]
                 try:
@@ -1759,6 +1832,8 @@ class VideoProcessor:
                 if os.path.exists(final_muxed_output_path) and final_muxed_output_path != video_stream_output_path:
                     os.remove(final_muxed_output_path)
                 os.rename(video_stream_output_path, final_muxed_output_path)
+                # Apply faststart for web streaming (imageio output doesn't have it)
+                self._tb_apply_faststart(final_muxed_output_path)
 
             progress(1.0, desc="Upscaling complete.")
             self.message_manager.add_success(f"Video upscaling complete: {final_output_path}")

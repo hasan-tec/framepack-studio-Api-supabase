@@ -1981,6 +1981,16 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
             logger.info(f"[POST-PROCESS] Callback URL provided - running upscale in BACKGROUND mode")
             logger.info(f"[POST-PROCESS] Callback URL: {req.callback_url}")
             
+            # FORCE safe values to prevent OOM crash in background processing
+            safe_tile_size = req.tile_size
+            if safe_tile_size == 0 or safe_tile_size > 512:
+                logger.warning(f"[POST-PROCESS] ⚠️ tile_size={req.tile_size} is risky, FORCING to 512 to prevent OOM")
+                safe_tile_size = 512
+            
+            safe_streaming = True  # ALWAYS force streaming in background mode
+            if not req.use_streaming:
+                logger.warning(f"[POST-PROCESS] ⚠️ use_streaming=False is risky, FORCING to True to prevent OOM crash")
+            
             # Define cleanup function
             cleanup_path = temp_video_path if has_base64 else None
             def cleanup():
@@ -1991,7 +2001,7 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
                     except Exception as e:
                         logger.warning(f"[BG-CLEANUP] Failed to clean up: {e}")
             
-            # Submit to background executor
+            # Submit to background executor with FORCED safe values
             run_postprocess_in_background(
                 operation_name="upscale",
                 callback_url=req.callback_url,
@@ -2000,16 +2010,17 @@ async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None))
                 video_path=temp_video_path,
                 model_key=req.model,
                 output_scale_factor_ui=req.scale_factor,
-                tile_size=req.tile_size,
+                tile_size=safe_tile_size,
                 enhance_face=req.enhance_face,
                 denoise_strength_ui=req.denoise_strength,
-                use_streaming=req.use_streaming,
+                use_streaming=safe_streaming,
                 metadata={
                     "model": req.model,
                     "scale_factor": req.scale_factor,
-                    "tile_size": req.tile_size,
+                    "tile_size": safe_tile_size,
                     "enhance_face": req.enhance_face,
-                    "denoise_strength": req.denoise_strength
+                    "denoise_strength": req.denoise_strength,
+                    "use_streaming": safe_streaming
                 }
             )
             
@@ -2150,6 +2161,11 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
             logger.info(f"[POST-PROCESS] Callback URL provided - running interpolation in BACKGROUND mode")
             logger.info(f"[POST-PROCESS] Callback URL: {req.callback_url}")
             
+            # FORCE streaming mode to prevent OOM crash in background processing
+            safe_streaming = True  # ALWAYS force streaming in background mode
+            if not req.use_streaming:
+                logger.warning(f"[POST-PROCESS] ⚠️ use_streaming=False is risky, FORCING to True to prevent OOM crash")
+            
             # Define cleanup function
             cleanup_path = temp_video_path if has_base64 else None
             def cleanup():
@@ -2160,7 +2176,7 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
                     except Exception as e:
                         logger.warning(f"[BG-CLEANUP] Failed to clean up: {e}")
             
-            # Submit to background executor
+            # Submit to background executor with FORCED safe values
             run_postprocess_in_background(
                 operation_name="interpolate",
                 callback_url=req.callback_url,
@@ -2169,11 +2185,11 @@ async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Heade
                 video_path=temp_video_path,
                 target_fps_mode=normalized_fps_mode,
                 speed_factor=req.speed_factor,
-                use_streaming=req.use_streaming,
+                use_streaming=safe_streaming,
                 metadata={
                     "fps_mode": req.fps_mode,
                     "speed_factor": req.speed_factor,
-                    "use_streaming": req.use_streaming
+                    "use_streaming": safe_streaming
                 }
             )
             
@@ -2826,12 +2842,18 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                         
                         if op.type == "upscale":
                             params = op.params or {}
-                            # Force streaming mode and reasonable tile size to prevent OOM
+                            # FORCE streaming mode and reasonable tile size to prevent OOM in background processing
                             tile_size = params.get("tile_size", 512)
-                            if tile_size == 0:
-                                tile_size = 512  # Use 512 instead of 0 (which means no tiling)
-                                logger.info(f"[BG-PIPELINE] tile_size was 0, using 512 to prevent OOM")
-                            use_streaming = params.get("use_streaming", True)  # Default to True for safety
+                            if tile_size == 0 or tile_size > 512:
+                                old_tile_size = tile_size
+                                tile_size = 512  # Use 512 to prevent OOM
+                                logger.warning(f"[BG-PIPELINE] ⚠️ tile_size was {old_tile_size}, FORCING to 512 to prevent OOM")
+                            
+                            # ALWAYS force streaming mode for background processing - in-memory mode causes 100% RAM crash
+                            requested_streaming = params.get("use_streaming", True)
+                            use_streaming = True  # FORCED - ignore request
+                            if not requested_streaming:
+                                logger.warning(f"[BG-PIPELINE] ⚠️ use_streaming was False, FORCING to True to prevent OOM crash")
                             
                             logger.info(f"[BG-PIPELINE] Starting upscale with model={params.get('model', 'RealESRGAN_x2plus')}, tile_size={tile_size}, streaming={use_streaming}")
                             
@@ -2848,7 +2870,12 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                         
                         elif op.type == "interpolate":
                             params = op.params or {}
-                            use_streaming = params.get("use_streaming", True)  # Default to True for safety
+                            # ALWAYS force streaming mode for background processing
+                            requested_streaming = params.get("use_streaming", True)
+                            use_streaming = True  # FORCED - ignore request
+                            if not requested_streaming:
+                                logger.warning(f"[BG-PIPELINE] ⚠️ use_streaming was False for interpolate, FORCING to True to prevent OOM crash")
+                            
                             logger.info(f"[BG-PIPELINE] Starting interpolate with fps_mode={params.get('fps_mode', '2x')}, streaming={use_streaming}")
                             output_path = tb_proc.tb_process_frames(
                                 video_path=current_video_path,

@@ -863,6 +863,10 @@ class BatchProcessingRequest(BaseModel):
         default=None,
         description="URL to POST results to when processing completes (webhook)"
     )
+    callback_token: Optional[str] = Field(
+        default=None,
+        description="Bearer token for callback authentication"
+    )
 
 class BatchVideoResult(BaseModel):
     """Result for a single video in batch processing"""
@@ -4575,6 +4579,7 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
         if req.callback_url:
             await send_postprocess_callback(
                 callback_url=req.callback_url,
+                callback_token=req.callback_token,
                 operation="batch",
                 success=failed == 0,
                 message=f"Batch processing complete: {successful} successful, {failed} failed",
@@ -4615,6 +4620,7 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
         if req.callback_url:
             await send_postprocess_callback(
                 callback_url=req.callback_url,
+                callback_token=req.callback_token,
                 operation="batch",
                 success=False,
                 error=error_msg,
@@ -5783,6 +5789,7 @@ async def send_postprocess_callback(
     output_base64: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    callback_token: Optional[str] = None,
     # Alternative parameter names for backward compatibility
     operation: str = None,
     output_video_base64: Optional[str] = None,
@@ -5800,6 +5807,7 @@ async def send_postprocess_callback(
         output_base64: Base64-encoded output (optional, can be large) - also accepts 'output_video_base64' alias
         error: Error message if operation failed
         metadata: Additional operation-specific metadata
+        callback_token: Bearer token for callback authentication
         message: Optional message (will be added to metadata if provided)
     """
     # Handle alternative parameter names for backward compatibility
@@ -5881,6 +5889,10 @@ async def send_postprocess_callback(
             "Content-Type": "application/json",
             "X-Operation-Type": operation_type,
         }
+        
+        # Add authorization token if provided
+        if callback_token:
+            headers["Authorization"] = f"Bearer {callback_token}"
         
         # Send the callback
         async with aiohttp.ClientSession() as session:

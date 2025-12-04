@@ -5329,7 +5329,29 @@ async def send_postprocess_callback(
             filename = os.path.basename(output_path)
             payload["output_filename"] = filename
             payload["output_path"] = output_path
-            payload["output_url"] = f"{BASE_URL}/outputs/{filename}"
+            
+            # Calculate the correct relative URL path from the outputs directory
+            # The output_path might be in a subdirectory like outputs/postprocessed_output/temp_processing/
+            try:
+                # Get absolute paths for comparison
+                abs_output_path = os.path.abspath(output_path)
+                abs_output_dir = os.path.abspath(api_output_dir)
+                
+                # Calculate relative path from outputs directory
+                if abs_output_path.startswith(abs_output_dir):
+                    relative_path = os.path.relpath(abs_output_path, abs_output_dir)
+                    # Convert Windows backslashes to forward slashes for URLs
+                    relative_path = relative_path.replace("\\", "/")
+                    payload["output_url"] = f"{BASE_URL}/outputs/{relative_path}"
+                else:
+                    # File is outside outputs directory, just use filename
+                    payload["output_url"] = f"{BASE_URL}/outputs/{filename}"
+                    
+                logger.debug(f"[CALLBACK] output_path: {output_path}")
+                logger.debug(f"[CALLBACK] output_url: {payload['output_url']}")
+            except Exception as path_err:
+                logger.warning(f"[CALLBACK] Could not calculate relative path: {path_err}, using filename only")
+                payload["output_url"] = f"{BASE_URL}/outputs/{filename}"
             
             # Add file size if available
             try:

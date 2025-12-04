@@ -3637,7 +3637,11 @@ async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Heade
     """
     validate_api_key(x_api_key)
     
-    logger.info(f"[FRAMES] Reassemble request: folder={req.folder_name}, fps={req.output_fps}")
+    logger.info(f"[FRAMES] Reassemble request received:")
+    logger.info(f"[FRAMES]   - folder_name: {req.folder_name}")
+    logger.info(f"[FRAMES]   - output_fps: {req.output_fps}")
+    logger.info(f"[FRAMES]   - output_name: {req.output_name}")
+    logger.info(f"[FRAMES]   - callback_url: {req.callback_url[:50] + '...' if req.callback_url and len(req.callback_url) > 50 else req.callback_url}")
     
     try:
         if tb_processor is None:
@@ -3646,14 +3650,26 @@ async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Heade
         
         # Build the full path to the frames folder
         frames_path = os.path.join(tb_processor.extracted_frames_target_path, req.folder_name)
+        logger.info(f"[FRAMES] Full frames path: {frames_path}")
         
-        if not os.path.exists(frames_path) or not os.path.isdir(frames_path):
-            logger.error(f"[FRAMES] Folder not found: {frames_path}")
+        if not os.path.exists(frames_path):
+            logger.error(f"[FRAMES] Folder does not exist: {frames_path}")
             raise HTTPException(status_code=404, detail=f"Folder '{req.folder_name}' not found")
         
+        if not os.path.isdir(frames_path):
+            logger.error(f"[FRAMES] Path is not a directory: {frames_path}")
+            raise HTTPException(status_code=404, detail=f"'{req.folder_name}' is not a folder")
+        
+        # Check how many frames are in the folder
+        frame_files = [f for f in os.listdir(frames_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
+        logger.info(f"[FRAMES] Found {len(frame_files)} frame files in folder")
+        
+        if len(frame_files) == 0:
+            logger.error(f"[FRAMES] No frame files found in folder: {frames_path}")
+            raise HTTPException(status_code=400, detail=f"No frame images found in folder '{req.folder_name}'")
+        
         # Reassemble frames to video
-        # Method signature: tb_reassemble_frames_to_video(frames_source, output_fps, output_base_name_override)
-        logger.info(f"[FRAMES] Starting reassembly from {frames_path}...")
+        logger.info(f"[FRAMES] Starting reassembly of {len(frame_files)} frames at {req.output_fps} fps...")
         output_path = tb_processor.tb_reassemble_frames_to_video(
             frames_source=frames_path,
             output_fps=req.output_fps,
@@ -3665,14 +3681,20 @@ async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Heade
             logger.error("[FRAMES] Reassembly failed - no output produced")
             raise HTTPException(status_code=500, detail="Frame reassembly failed - check server logs")
         
+        # Get output file size
+        output_size = os.path.getsize(output_path)
         logger.info(f"[FRAMES] Reassembly complete: {output_path}")
+        logger.info(f"[FRAMES] Output video size: {output_size} bytes ({output_size / 1024 / 1024:.2f} MB)")
         
         # Read output and convert to base64
+        logger.info(f"[FRAMES] Encoding output video to base64...")
         with open(output_path, 'rb') as f:
             output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        logger.info(f"[FRAMES] Base64 encoded length: {len(output_base64)} characters")
         
         # Send callback if URL provided
         if req.callback_url:
+            logger.info(f"[FRAMES] Sending callback to: {req.callback_url[:50]}...")
             await send_postprocess_callback(
                 callback_url=req.callback_url,
                 operation="reassemble_frames",
@@ -3686,7 +3708,9 @@ async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Heade
                     "output_name": req.output_name
                 }
             )
+            logger.info(f"[FRAMES] Callback sent successfully")
         
+        logger.info(f"[FRAMES] Returning success response")
         return ReassembleFramesResponse(
             success=True,
             message="Frames reassembled successfully",

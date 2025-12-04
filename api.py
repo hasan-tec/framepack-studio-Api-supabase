@@ -2461,7 +2461,8 @@ async def create_video_loop(req: VideoLoopRequest, x_api_key: str = Header(None)
         output_path = tb_processor.tb_create_loop(
             video_path=temp_video_path,
             loop_type=req.loop_type,
-            num_loops=req.num_loops
+            num_loops=req.num_loops,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
@@ -2690,7 +2691,8 @@ async def export_video(req: ExportVideoRequest, x_api_key: str = Header(None)):
             export_format=req.format,
             quality_slider=req.quality,
             max_width=req.max_width or 1920,  # Default max width
-            output_base_name_override=req.output_name
+            output_base_name_override=req.output_name,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
@@ -2917,7 +2919,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                             output_path = tb_proc.tb_create_loop(
                                 video_path=current_video_path,
                                 loop_type=params.get("loop_type", "loop"),
-                                num_loops=params.get("num_loops", 2)
+                                num_loops=params.get("num_loops", 2),
+                                progress=DummyProgress()
                             )
                             logger.info(f"[BG-PIPELINE] Loop returned: {output_path}")
                         
@@ -2929,7 +2932,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 export_format=params.get("format", "MP4"),
                                 quality_slider=params.get("quality", 85),
                                 max_width=params.get("max_width") or 1920,
-                                output_base_name_override=params.get("output_name")
+                                output_base_name_override=params.get("output_name"),
+                                progress=DummyProgress()
                             )
                             logger.info(f"[BG-PIPELINE] Export returned: {output_path}")
                         
@@ -3062,7 +3066,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                 output_path = tb_processor.tb_create_loop(
                     video_path=current_video_path,
                     loop_type=params.get("loop_type", "loop"),
-                    num_loops=params.get("num_loops", 2)
+                    num_loops=params.get("num_loops", 2),
+                    progress=DummyProgress()
                 )
             
             elif op.type == "export":
@@ -3072,7 +3077,8 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                     export_format=params.get("format", "MP4"),
                     quality_slider=params.get("quality", 85),
                     max_width=params.get("max_width") or 1920,
-                    output_base_name_override=params.get("output_name")
+                    output_base_name_override=params.get("output_name"),
+                    progress=DummyProgress()
                 )
             
             # Check result
@@ -4279,7 +4285,8 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                         output_path = tb_processor.tb_create_loop(
                             video_path=current_video_path,
                             loop_type=params.get("loop_type", "loop"),
-                            num_loops=params.get("num_loops", 2)
+                            num_loops=params.get("num_loops", 2),
+                            progress=DummyProgress()
                         )
                     elif op.type == "export":
                         params = op.params or {}
@@ -4288,7 +4295,8 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                             export_format=params.get("format", "MP4"),
                             quality_slider=params.get("quality", 85),
                             max_width=params.get("max_width") or 1920,
-                            output_base_name_override=params.get("output_name")
+                            output_base_name_override=params.get("output_name"),
+                            progress=DummyProgress()
                         )
                     
                     if output_path is None or not os.path.exists(output_path):

@@ -693,6 +693,15 @@ class SaveFrameResponse(BaseModel):
     saved_path: Optional[str] = None
     frame_base64: Optional[str] = None
 
+class GetFrameResponse(BaseModel):
+    """Response model for getting a single frame with base64 image data"""
+    success: bool
+    folder: str
+    filename: str
+    size: int
+    base64: str
+    mime_type: str = "image/png"
+
 class ReassembleFramesRequest(BaseModel):
     """Request model for reassembling frames into a video"""
     folder_name: str = Field(..., description="Name of the folder containing extracted frames")
@@ -3492,6 +3501,70 @@ async def delete_single_frame(folder: str, frame: str, x_api_key: str = Header(N
         raise
     except Exception as e:
         error_msg = f"Failed to delete frame: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/frames/{folder}/{frame}", response_model=GetFrameResponse, tags=["Frames Studio"])
+async def get_single_frame(folder: str, frame: str, x_api_key: str = Header(None)):
+    """
+    Get a single frame image with base64 data for preview.
+    
+    Returns the frame image encoded as base64 for displaying in the UI.
+    Use this to show frame previews before selecting frames to delete.
+    
+    The frame parameter should be the filename (e.g., "frame_000123.png").
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Get frame request: {folder}/{frame}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Build the full path to the frame
+        frame_path = os.path.join(tb_processor.extracted_frames_target_path, folder, frame)
+        
+        if not os.path.exists(frame_path):
+            logger.error(f"[FRAMES] Frame not found: {frame_path}")
+            raise HTTPException(status_code=404, detail=f"Frame '{frame}' not found in folder '{folder}'")
+        
+        # Determine MIME type based on extension
+        ext = os.path.splitext(frame)[1].lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp'
+        }
+        mime_type = mime_types.get(ext, 'image/png')
+        
+        # Read the frame and encode as base64
+        with open(frame_path, 'rb') as f:
+            frame_data = f.read()
+        
+        frame_base64 = base64.b64encode(frame_data).decode('utf-8')
+        frame_size = len(frame_data)
+        
+        logger.info(f"[FRAMES] Successfully read frame: {frame} ({frame_size} bytes)")
+        
+        return GetFrameResponse(
+            success=True,
+            folder=folder,
+            filename=frame,
+            size=frame_size,
+            base64=frame_base64,
+            mime_type=mime_type
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to get frame: {str(e)}"
         logger.error(f"[FRAMES] {error_msg}")
         logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=error_msg)

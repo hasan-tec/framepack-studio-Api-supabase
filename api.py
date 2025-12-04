@@ -1132,6 +1132,97 @@ class GenerationResponse(BaseModel):
     message: str
 
 
+# --- Batch Generation Request/Response Models ---
+class BatchGenerationItem(BaseModel):
+    """A single item in a batch generation request"""
+    input_image_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded input image for this job"
+    )
+    input_image_url: Optional[str] = Field(
+        default=None,
+        description="URL to download input image from for this job"
+    )
+    prompt: Optional[str] = Field(
+        default=None,
+        description="Override prompt for this specific job (optional)"
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Override seed for this specific job (optional, -1 for random)"
+    )
+    end_frame_image_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded end frame image for this job (optional)"
+    )
+
+class BatchGenerationRequest(BaseModel):
+    """Request model for batch video generation - submit multiple jobs at once"""
+    
+    # List of items to process
+    items: List[BatchGenerationItem] = Field(
+        ...,
+        min_items=1,
+        max_items=50,
+        description="List of items to generate (each needs an image, max 50)"
+    )
+    
+    # Shared parameters applied to all jobs
+    prompt: str = Field(
+        ...,
+        description="Default prompt for all jobs (can be overridden per item)"
+    )
+    negative_prompt: str = Field(
+        default="low quality, worst quality, deformed, distorted, disfigured, blurry, bad anatomy",
+        description="Negative prompt for all jobs"
+    )
+    model_type: ModelType = Field(
+        default=ModelType.ORIGINAL,
+        description="Model type for all jobs"
+    )
+    steps: int = Field(default=25, ge=1, le=100, description="Steps for all jobs")
+    total_second_length: float = Field(default=6.0, ge=1.0, le=120.0, description="Video length for all jobs")
+    resolution_w: int = Field(default=640, description="Width for all jobs")
+    resolution_h: int = Field(default=640, description="Height for all jobs")
+    cfg_scale: float = Field(default=1.0, ge=0.0, le=20.0, description="CFG scale for all jobs")
+    distilled_cfg_scale: float = Field(default=10.0, ge=0.0, le=20.0, description="Distilled CFG for all jobs")
+    
+    # Seed handling
+    randomize_seed: bool = Field(
+        default=True,
+        description="If true, generate random seeds for each job. If false, use base_seed + index."
+    )
+    base_seed: int = Field(
+        default=-1,
+        description="Base seed (used when randomize_seed=false, or as first seed when true)"
+    )
+    
+    # LoRA settings (shared)
+    lora_name: Optional[str] = Field(default=None, description="LoRA to use for all jobs")
+    lora_strength: float = Field(default=1.0, ge=0.0, le=2.0, description="LoRA strength")
+    
+    # Callback
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results when ALL jobs complete (batch callback)"
+    )
+
+class BatchGenerationJobInfo(BaseModel):
+    """Info about a single job in the batch response"""
+    index: int
+    job_id: str
+    status: str
+    seed: int
+    input_source: str
+
+class BatchGenerationResponse(BaseModel):
+    """Response after submitting a batch generation request"""
+    success: bool
+    message: str
+    total_jobs: int
+    jobs: List[BatchGenerationJobInfo]
+
+
 class JobStatusResponse(BaseModel):
     """Response for job status check"""
     job_id: str
@@ -5052,6 +5143,182 @@ async def generate_video(req: GenerationRequest, x_api_key: str = Header(None)):
         resolution={"width": estimated_bucket_w, "height": estimated_bucket_h},
         estimated_time_seconds=estimated_time,
         message=f"Job queued successfully. Requested: {req.resolution_w}x{req.resolution_h}, estimated bucket: {estimated_bucket_w}x{estimated_bucket_h}. Time: ~{estimated_time}s"
+    )
+
+
+@app.post("/generate/batch", response_model=BatchGenerationResponse, tags=["Generation"])
+async def batch_generate(req: BatchGenerationRequest, x_api_key: str = Header(None)):
+    """
+    Submit multiple video generation jobs at once (batch processing).
+    
+    This is equivalent to Gradio's "Add Batch to Queue" button.
+    Each item in the batch uses the shared parameters, with optional per-item overrides.
+    
+    Features:
+    - Submit up to 50 jobs at once
+    - Shared parameters (prompt, steps, model, etc.) apply to all jobs
+    - Per-item overrides for prompt, seed, and input image
+    - Automatic seed randomization option
+    - All jobs are added to the same queue as single /generate calls
+    
+    Use /queue to monitor all jobs, or /status/{job_id} for individual job status.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[BATCH-GEN] Batch generation request: {len(req.items)} items, model={req.model_type}")
+    
+    jobs_info = []
+    
+    # Determine starting seed
+    if req.base_seed == -1:
+        current_seed = random.randint(0, 2**31 - 1)
+    else:
+        current_seed = req.base_seed
+    
+    # Calculate estimated bucket resolution (shared for all jobs)
+    estimated_bucket_h, estimated_bucket_w = apply_bucket_resolution(req.resolution_w, req.resolution_h)
+    logger.info(f"[BATCH-GEN] Shared resolution: {req.resolution_w}x{req.resolution_h} -> bucket: {estimated_bucket_w}x{estimated_bucket_h}")
+    
+    for i, item in enumerate(req.items):
+        try:
+            logger.info(f"[BATCH-GEN] Processing item {i+1}/{len(req.items)}")
+            
+            # Determine seed for this job
+            if item.seed is not None:
+                job_seed = item.seed if item.seed != -1 else random.randint(0, 2**31 - 1)
+            else:
+                job_seed = current_seed
+            
+            # Determine prompt for this job
+            job_prompt = item.prompt if item.prompt else req.prompt
+            
+            # Process input image
+            input_image = None
+            has_input_image = False
+            input_source = "none"
+            
+            if item.input_image_base64:
+                input_image = decode_base64_image(item.input_image_base64)
+                has_input_image = True
+                input_source = "base64"
+                logger.info(f"[BATCH-GEN] Item {i}: Decoded base64 image: {input_image.shape}")
+            elif item.input_image_url:
+                input_image = await download_image_from_url(item.input_image_url)
+                has_input_image = True
+                input_source = item.input_image_url[:50]
+                logger.info(f"[BATCH-GEN] Item {i}: Downloaded image from URL")
+            
+            # If no input image, create latent background
+            if input_image is None:
+                input_image = create_latent_image(req.resolution_w, req.resolution_h, LatentType.BLACK)
+                logger.info(f"[BATCH-GEN] Item {i}: Created latent image for T2V")
+                input_source = "latent"
+            
+            # Process end frame if provided
+            end_frame_image = None
+            if item.end_frame_image_base64:
+                end_frame_image = decode_base64_image(item.end_frame_image_base64)
+                logger.info(f"[BATCH-GEN] Item {i}: Decoded end frame image")
+            
+            # Process LoRA
+            selected_loras = []
+            lora_values_list = []
+            if req.lora_name and req.lora_name in lora_names:
+                selected_loras.append(req.lora_name)
+                lora_values_list.append(req.lora_strength)
+            
+            # Build job parameters
+            job_params = {
+                'model_type': req.model_type.value,
+                'input_image': input_image.copy() if input_image is not None else None,
+                'has_input_image': has_input_image,
+                'latent_type': LatentType.BLACK.value,
+                'end_frame_image': end_frame_image.copy() if end_frame_image is not None else None,
+                'end_frame_strength': 1.0,
+                'prompt_text': job_prompt,
+                'n_prompt': req.negative_prompt,
+                'seed': job_seed,
+                'total_second_length': req.total_second_length,
+                'latent_window_size': 9,
+                'steps': req.steps,
+                'cfg': req.cfg_scale,
+                'gs': req.distilled_cfg_scale,
+                'rs': 0.0,
+                'resolutionW': req.resolution_w,
+                'resolutionH': req.resolution_h,
+                'use_teacache': False,
+                'teacache_num_steps': 5,
+                'teacache_rel_l1_thresh': 0.15,
+                'use_magcache': False,
+                'magcache_threshold': 0.0,
+                'magcache_max_consecutive_skips': 50,
+                'magcache_retention_ratio': 0.5,
+                'blend_sections': False,
+                'selected_loras': selected_loras,
+                'lora_values': lora_values_list,
+                'lora_loaded_names': lora_names,
+                'output_dir': settings.get("output_dir"),
+                'metadata_dir': settings.get("metadata_dir"),
+                'input_files_dir': settings.get("input_files_dir"),
+                'input_image_path': None,
+                'end_frame_image_path': None,
+                'input_video': None,
+                'combine_with_source': False,
+                'num_cleaned_frames': 24,
+                'save_metadata_checked': True,
+                'callback_url': req.callback_url,  # All jobs share the same callback
+                'callback_token': None,
+                'batch_index': i,  # Track which item in batch this is
+                'batch_total': len(req.items),
+            }
+            
+            # Add to queue
+            job_id = job_queue.add_job(job_params)
+            logger.info(f"[BATCH-GEN] Item {i}: Job {job_id} added with seed {job_seed}")
+            
+            # Initialize progress tracking
+            with progress_lock:
+                job_progress_store[job_id] = {
+                    "progress_percent": 0,
+                    "progress_desc": "Queued (batch)",
+                    "updated_at": time.time()
+                }
+            
+            jobs_info.append(BatchGenerationJobInfo(
+                index=i,
+                job_id=job_id,
+                status="pending",
+                seed=job_seed,
+                input_source=input_source
+            ))
+            
+            # Update seed for next job
+            if req.randomize_seed:
+                current_seed = random.randint(0, 2**31 - 1)
+            else:
+                current_seed += 1
+                
+        except Exception as e:
+            logger.error(f"[BATCH-GEN] Error processing item {i}: {e}")
+            logger.error(f"[BATCH-GEN] Traceback: {traceback.format_exc()}")
+            # Continue with next item instead of failing entire batch
+            jobs_info.append(BatchGenerationJobInfo(
+                index=i,
+                job_id="error",
+                status="failed",
+                seed=0,
+                input_source=f"error: {str(e)[:50]}"
+            ))
+    
+    successful_jobs = [j for j in jobs_info if j.status != "failed"]
+    
+    logger.info(f"[BATCH-GEN] Batch complete: {len(successful_jobs)}/{len(req.items)} jobs queued")
+    
+    return BatchGenerationResponse(
+        success=len(successful_jobs) > 0,
+        message=f"Batch queued: {len(successful_jobs)}/{len(req.items)} jobs added successfully",
+        total_jobs=len(jobs_info),
+        jobs=jobs_info
     )
 
 

@@ -1202,6 +1202,10 @@ async def download_image_from_url(url: str) -> np.ndarray:
 def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
     """Download a file from URL and return the local file path.
     
+    If the URL points to a local /outputs/ path on this server, the file is
+    read directly from disk to avoid self-referential HTTP requests that can
+    cause deadlocks or timeouts.
+    
     Args:
         url: The URL to download from
         allowed_extensions: List of allowed file extensions (e.g. ['.mp4', '.webm'])
@@ -1214,9 +1218,46 @@ def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
     logger.info(f"[DOWNLOAD] Downloading file from URL: {url[:100]}...")
     
     try:
-        # Parse URL to get filename
+        # Parse URL to get filename and path
         parsed_url = urlparse(url)
         url_path = unquote(parsed_url.path)
+        
+        # =====================================================================
+        # CHECK FOR LOCAL /outputs/ FILE - Avoid self-referential HTTP requests
+        # =====================================================================
+        # If the URL points to our own /outputs/ directory, read directly from disk
+        # This prevents deadlocks when the API tries to download from itself
+        if '/outputs/' in url_path:
+            # Extract the relative path after /outputs/
+            outputs_index = url_path.find('/outputs/')
+            relative_path = url_path[outputs_index + len('/outputs/'):]
+            local_path = os.path.join(api_output_dir, relative_path)
+            
+            # Normalize the path to prevent directory traversal attacks
+            local_path = os.path.normpath(local_path)
+            normalized_output_dir = os.path.normpath(api_output_dir)
+            
+            # Security check: ensure the path is within the outputs directory
+            if local_path.startswith(normalized_output_dir) and os.path.exists(local_path):
+                logger.info(f"[DOWNLOAD] Detected local outputs file, reading directly from disk: {local_path}")
+                
+                # Validate extension if needed
+                _, ext = os.path.splitext(local_path)
+                if allowed_extensions and ext.lower() not in [e.lower() for e in allowed_extensions]:
+                    logger.warning(f"[DOWNLOAD] Local file extension {ext} not in allowed list")
+                    raise HTTPException(status_code=400, detail=f"File extension {ext} not allowed")
+                
+                file_size = os.path.getsize(local_path)
+                logger.info(f"[DOWNLOAD] Local file found: {local_path} ({file_size} bytes)")
+                
+                # Return the local path directly - no need to copy
+                return local_path
+            else:
+                logger.info(f"[DOWNLOAD] Path {local_path} not found locally or outside outputs dir, will try HTTP download")
+        
+        # =====================================================================
+        # STANDARD HTTP DOWNLOAD for external URLs
+        # =====================================================================
         filename = os.path.basename(url_path) or f"downloaded_{uuid.uuid4().hex[:8]}"
         
         # Get extension
@@ -1233,6 +1274,7 @@ def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
         temp_path = os.path.join(api_output_dir, f"download_{uuid.uuid4().hex[:8]}{ext}")
         
         # Download the file
+        logger.info(f"[DOWNLOAD] Starting HTTP download from external URL...")
         response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
         
@@ -1253,6 +1295,8 @@ def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
     except requests.exceptions.RequestException as e:
         logger.error(f"[DOWNLOAD] Request error: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+    except HTTPException:
+        raise  # Re-raise HTTPExceptions as-is
     except Exception as e:
         logger.error(f"[DOWNLOAD] Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")

@@ -2848,15 +2848,19 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                         
                         elif op.type == "interpolate":
                             params = op.params or {}
+                            use_streaming = params.get("use_streaming", True)  # Default to True for safety
+                            logger.info(f"[BG-PIPELINE] Starting interpolate with fps_mode={params.get('fps_mode', '2x')}, streaming={use_streaming}")
                             output_path = tb_proc.tb_process_frames(
                                 video_path=current_video_path,
                                 target_fps_mode=params.get("fps_mode", "2x"),
                                 speed_factor=params.get("speed_factor", 1.0),
-                                use_streaming=params.get("use_streaming", True)
+                                use_streaming=use_streaming
                             )
+                            logger.info(f"[BG-PIPELINE] Interpolate returned: {output_path}")
                         
                         elif op.type == "filters":
                             params = op.params or {}
+                            logger.info(f"[BG-PIPELINE] Starting filters with params: brightness={params.get('brightness', 0.0)}, contrast={params.get('contrast', 1.0)}")
                             output_path = tb_proc.tb_apply_filters(
                                 video_path=current_video_path,
                                 brightness=params.get("brightness", 0.0),
@@ -2870,17 +2874,21 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 s_curve_contrast=params.get("s_curve_contrast", 0.0),
                                 film_grain_strength=params.get("film_grain", 0.0)
                             )
+                            logger.info(f"[BG-PIPELINE] Filters returned: {output_path}")
                         
                         elif op.type == "loop":
                             params = op.params or {}
+                            logger.info(f"[BG-PIPELINE] Starting loop with type={params.get('loop_type', 'loop')}, num_loops={params.get('num_loops', 2)}")
                             output_path = tb_proc.tb_create_loop(
                                 video_path=current_video_path,
                                 loop_type=params.get("loop_type", "loop"),
                                 num_loops=params.get("num_loops", 2)
                             )
+                            logger.info(f"[BG-PIPELINE] Loop returned: {output_path}")
                         
                         elif op.type == "export":
                             params = op.params or {}
+                            logger.info(f"[BG-PIPELINE] Starting export with format={params.get('format', 'MP4')}, quality={params.get('quality', 85)}")
                             output_path = tb_proc.tb_export_video(
                                 video_path=current_video_path,
                                 export_format=params.get("format", "MP4"),
@@ -2888,6 +2896,7 @@ async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
                                 max_width=params.get("max_width") or 1920,
                                 output_base_name_override=params.get("output_name")
                             )
+                            logger.info(f"[BG-PIPELINE] Export returned: {output_path}")
                         
                         # Check result
                         if output_path is None or not os.path.exists(output_path):

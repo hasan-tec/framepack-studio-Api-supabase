@@ -12,12 +12,14 @@ import base64
 import random
 import asyncio
 import traceback
+import requests
+from datetime import datetime
 from pathlib import PurePath, Path
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, model_validator
 from typing import Optional, List, Dict, Any, Union
 from enum import Enum
 import uvicorn
@@ -43,6 +45,30 @@ from modules.pipelines.worker import worker
 from modules.settings import Settings
 from modules import DUMMY_LORA_NAME
 from modules.generators import create_model_generator
+
+# --- AI FEATURES IMPORTS (Phase 1) ---
+from modules.llm_enhancer import enhance_prompt, unload_enhancing_model
+from modules.llm_captioner import caption_image, unload_captioning_model
+
+# --- POST-PROCESSING IMPORTS (Phase 2) ---
+from modules.toolbox_app import tb_processor, tb_filter_presets_data
+
+# --- PHASE 3 IMPORTS: Workflow Presets ---
+from modules.toolbox_app import (
+    tb_workflow_presets_data, 
+    TB_WORKFLOW_PRESETS_FILE,
+    _get_default_workflow_params,
+    _initialize_workflow_presets,
+    TB_DEFAULT_FILTER_SETTINGS
+)
+from modules.toolbox.toolbox_processor import VideoProcessor
+from modules.toolbox.system_monitor import SystemMonitor
+
+# --- PHASE 4 IMPORTS: Filter Presets & Model Management ---
+from modules.toolbox_app import (
+    TB_BUILT_IN_PRESETS_FILE,
+    _initialize_presets as _initialize_filter_presets
+)
 
 # --- 3. LOGGING SETUP ---
 import logging
@@ -239,6 +265,647 @@ class CacheType(str, Enum):
     NONE = "None"
     TEACACHE = "TeaCache"
     MAGCACHE = "MagCache"
+
+
+# --- 12.5 AI FEATURES REQUEST/RESPONSE MODELS (Phase 1) ---
+
+class EnhancePromptRequest(BaseModel):
+    """Request model for prompt enhancement"""
+    prompt: str = Field(
+        ...,
+        description="The prompt to enhance. Can be simple text or timestamped format like '[1s: text] [3s: more text]'",
+        min_length=1,
+        max_length=10000
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when enhancement completes (webhook)"
+    )
+
+class EnhancePromptResponse(BaseModel):
+    """Response model for prompt enhancement"""
+    success: bool
+    original_prompt: str
+    enhanced_prompt: str
+    message: str
+
+class CaptionImageRequest(BaseModel):
+    """Request model for image captioning"""
+    image_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded image to caption"
+    )
+    image_url: Optional[str] = Field(
+        default=None,
+        description="URL to download image from for captioning"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when captioning completes (webhook)"
+    )
+    
+    @validator('image_base64', 'image_url', pre=True, always=True)
+    def check_at_least_one_image_source(cls, v, values):
+        # This validator runs for each field
+        return v
+    
+    def __init__(self, **data):
+        super().__init__(**data)
+        if not self.image_base64 and not self.image_url:
+            raise ValueError("Either image_base64 or image_url must be provided")
+
+class CaptionImageResponse(BaseModel):
+    """Response model for image captioning"""
+    success: bool
+    caption: str
+    message: str
+
+class UnloadModelRequest(BaseModel):
+    """Request model for unloading AI models"""
+    model: str = Field(
+        ...,
+        description="Model to unload: 'enhancer', 'captioner', or 'all'"
+    )
+
+class UnloadModelResponse(BaseModel):
+    """Response model for unloading AI models"""
+    success: bool
+    message: str
+    models_unloaded: List[str]
+
+
+# --- 12.6 POST-PROCESSING REQUEST/RESPONSE MODELS (Phase 2) ---
+
+class FPSMode(str, Enum):
+    """Frame interpolation modes"""
+    NO_INTERPOLATION = "No Interpolation"
+    TWO_X = "2x Frames"
+    FOUR_X = "4x Frames"
+
+class LoopType(str, Enum):
+    """Video loop types"""
+    LOOP = "loop"
+    PING_PONG = "ping-pong"
+
+class ExportFormat(str, Enum):
+    """Video export formats"""
+    MP4 = "MP4"
+    WEBM = "WebM"
+    GIF = "GIF"
+
+class UpscaleModel(str, Enum):
+    """Available ESRGAN upscale models"""
+    REALESRGAN_X2PLUS = "RealESRGAN_x2plus"
+    REALESRGAN_X4PLUS = "RealESRGAN_x4plus"
+    REALESRNET_X4PLUS = "RealESRNet_x4plus"
+    REALESR_GENERAL_X4V3 = "RealESR-general-x4v3"
+    REALESRGAN_X4PLUS_ANIME_6B = "RealESRGAN_x4plus_anime_6B"
+    REALESR_ANIMEVIDEO_V3 = "RealESR_AnimeVideo_v3"
+
+# --- Video Analysis ---
+class AnalyzeVideoRequest(BaseModel):
+    """Request model for video analysis"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to analyze")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    
+    @model_validator(mode='after')
+    def check_video_source(self):
+        if not self.video_url and not self.video_base64:
+            raise ValueError('Either video_url or video_base64 must be provided')
+        return self
+
+class AnalyzeVideoResponse(BaseModel):
+    """Response model for video analysis"""
+    success: bool
+    analysis: Optional[str] = None
+    file_size: Optional[str] = None
+    duration: Optional[str] = None
+    fps: Optional[str] = None
+    resolution: Optional[str] = None
+    frame_count: Optional[str] = None
+    has_audio: Optional[str] = None
+    message: str
+
+# --- Upscale Video ---
+class UpscaleVideoRequest(BaseModel):
+    """Request model for video upscaling"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to upscale")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    model: str = Field(
+        default="RealESRGAN_x4plus",
+        description="ESRGAN model to use for upscaling"
+    )
+    scale_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        le=4.0,
+        description="Target scale factor (1.0-4.0, depends on model)"
+    )
+    tile_size: int = Field(
+        default=0,
+        description="Tile size for processing (0=auto, 256, 512). Smaller uses less VRAM."
+    )
+    enhance_face: bool = Field(
+        default=False,
+        description="Use GFPGAN to enhance faces"
+    )
+    denoise_strength: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Denoise strength (only for RealESR-general-x4v3 model)"
+    )
+    use_streaming: bool = Field(
+        default=False,
+        description="Use streaming mode for low memory processing of large videos"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Frame Interpolation ---
+class InterpolateVideoRequest(BaseModel):
+    """Request model for frame interpolation (RIFE)"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to interpolate")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    fps_mode: str = Field(
+        default="2x",
+        description="Frame interpolation mode: '2x' or '4x'"
+    )
+    speed_factor: float = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+        description="Speed adjustment factor (0.25=4x slower, 4.0=4x faster)"
+    )
+    use_streaming: bool = Field(
+        default=False,
+        description="Use streaming mode for low memory processing"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Video Filters ---
+class VideoFiltersRequest(BaseModel):
+    """Request model for applying video filters"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to process")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    brightness: int = Field(default=0, ge=-100, le=100, description="Brightness adjustment (-100 to 100)")
+    contrast: float = Field(default=1.0, ge=0.0, le=3.0, description="Contrast multiplier (0-3)")
+    saturation: float = Field(default=1.0, ge=0.0, le=3.0, description="Saturation multiplier (0-3)")
+    temperature: int = Field(default=0, ge=-100, le=100, description="Color temperature (-100=cool to 100=warm)")
+    sharpen: float = Field(default=0.0, ge=0.0, le=5.0, description="Sharpen strength (0-5)")
+    blur: float = Field(default=0.0, ge=0.0, le=5.0, description="Blur strength (0-5)")
+    denoise: float = Field(default=0.0, ge=0.0, le=10.0, description="Denoise strength (0-10)")
+    vignette: int = Field(default=0, ge=0, le=100, description="Vignette strength (0-100)")
+    s_curve_contrast: int = Field(default=0, ge=0, le=100, description="S-curve contrast (0-100)")
+    film_grain: int = Field(default=0, ge=0, le=50, description="Film grain strength (0-50)")
+    # Optional preset support
+    preset: Optional[str] = Field(default=None, description="Filter preset name (cinematic, vintage, cool, warm, dramatic)")
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Video Loop ---
+class VideoLoopRequest(BaseModel):
+    """Request model for creating video loops"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to loop")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    loop_type: str = Field(
+        default="loop",
+        description="Loop type: 'loop' (repeat) or 'ping-pong' (forward-backward)"
+    )
+    num_loops: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Number of additional loops/repeats (1 = plays twice total)"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Join Videos ---
+class JoinVideosRequest(BaseModel):
+    """Request model for joining/concatenating videos"""
+    video_urls: List[str] = Field(
+        ...,
+        min_items=2,
+        description="List of video URLs to join (minimum 2)"
+    )
+    output_name: Optional[str] = Field(
+        default=None,
+        description="Custom output filename (optional)"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Export/Compress Video ---
+class ExportVideoRequest(BaseModel):
+    """Request model for exporting/compressing video"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file to export")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    format: str = Field(
+        default="MP4",
+        description="Output format: MP4, WebM, or GIF"
+    )
+    quality: int = Field(
+        default=85,
+        ge=0,
+        le=100,
+        description="Quality (0-100, higher = better quality, larger file)"
+    )
+    max_width: int = Field(
+        default=1024,
+        ge=256,
+        le=4096,
+        description="Maximum output width in pixels (maintains aspect ratio)"
+    )
+    output_name: Optional[str] = Field(
+        default=None,
+        description="Custom output filename (optional)"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Pipeline Operation ---
+class PipelineOperation(BaseModel):
+    """Single operation in a processing pipeline"""
+    type: str = Field(
+        ...,
+        description="Operation type: 'upscale', 'interpolate', 'filters', 'loop', 'export'"
+    )
+    params: Dict[str, Any] = Field(
+        default={},
+        description="Operation-specific parameters"
+    )
+
+class PipelineRequest(BaseModel):
+    """Request model for running a processing pipeline"""
+    video_url: Optional[str] = Field(default=None, description="URL to the input video")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    operations: List[PipelineOperation] = Field(
+        ...,
+        min_items=1,
+        description="List of operations to perform in order"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+# --- Generic Post-Processing Response ---
+class PostProcessResponse(BaseModel):
+    """Generic response model for post-processing operations"""
+    success: bool
+    output_url: Optional[str] = None
+    output_filename: Optional[str] = None
+    message: str
+    processing_time_seconds: Optional[float] = None
+
+
+# --- Specific Post-Processing Response Models ---
+class UpscaleVideoResponse(BaseModel):
+    """Response model for video upscaling"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class InterpolateVideoResponse(BaseModel):
+    """Response model for video interpolation"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class VideoFiltersResponse(BaseModel):
+    """Response model for video filters"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class VideoLoopResponse(BaseModel):
+    """Response model for video loop"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class JoinVideosResponse(BaseModel):
+    """Response model for video join"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class ExportVideoResponse(BaseModel):
+    """Response model for video export"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+class PipelineResponse(BaseModel):
+    """Response model for pipeline processing"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+    operations_completed: Optional[List[Dict[str, Any]]] = None
+
+
+# ============================================================================
+# PHASE 3: FRAMES STUDIO, WORKFLOW PRESETS, SYSTEM UTILITIES
+# ============================================================================
+
+# --- Frames Studio Request/Response Models ---
+class ExtractFramesRequest(BaseModel):
+    """Request model for extracting frames from a video"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    extraction_rate: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        description="Extract every Nth frame (1 = all frames, 2 = every 2nd frame, etc.)"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+class ExtractFramesResponse(BaseModel):
+    """Response model for frame extraction"""
+    success: bool
+    message: str
+    folder_name: Optional[str] = None
+    frame_count: Optional[int] = None
+    frames_path: Optional[str] = None
+
+class FrameFoldersResponse(BaseModel):
+    """Response model for listing frame folders"""
+    success: bool
+    folders: List[str]
+    message: str
+
+class FrameInfo(BaseModel):
+    """Information about a single frame"""
+    filename: str
+    path: str
+    index: int
+
+class ListFramesResponse(BaseModel):
+    """Response model for listing frames in a folder"""
+    success: bool
+    folder: str
+    frames: List[FrameInfo]
+    total_count: int
+    message: str
+
+class DeleteFolderResponse(BaseModel):
+    """Response model for deleting a frame folder"""
+    success: bool
+    folder: str
+    message: str
+
+class DeleteFrameResponse(BaseModel):
+    """Response model for deleting a single frame"""
+    success: bool
+    folder: str
+    frame: str
+    message: str
+
+class SaveFrameResponse(BaseModel):
+    """Response model for saving a single frame"""
+    success: bool
+    message: str
+    saved_path: Optional[str] = None
+    frame_base64: Optional[str] = None
+
+class ReassembleFramesRequest(BaseModel):
+    """Request model for reassembling frames into a video"""
+    folder_name: str = Field(..., description="Name of the folder containing extracted frames")
+    output_fps: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        description="Output video frame rate"
+    )
+    output_name: Optional[str] = Field(
+        default=None,
+        description="Custom output video name (optional)"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+class ReassembleFramesResponse(BaseModel):
+    """Response model for frame reassembly"""
+    success: bool
+    message: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+
+# --- Workflow Preset Request/Response Models ---
+class WorkflowPresetParams(BaseModel):
+    """Parameters for a workflow preset"""
+    # Upscale parameters
+    upscale_model: Optional[str] = Field(default="RealESRGAN_x2plus")
+    upscale_factor: Optional[float] = Field(default=2.0)
+    tile_size: Optional[int] = Field(default=0)
+    enhance_face: Optional[bool] = Field(default=False)
+    denoise_strength: Optional[float] = Field(default=0.5)
+    upscale_use_streaming: Optional[bool] = Field(default=False)
+    
+    # Frame adjust parameters
+    fps_mode: Optional[str] = Field(default="No Interpolation")
+    speed_factor: Optional[float] = Field(default=1.0)
+    frames_use_streaming: Optional[bool] = Field(default=False)
+    
+    # Loop parameters
+    loop_type: Optional[str] = Field(default="loop")
+    num_loops: Optional[int] = Field(default=1)
+    
+    # Filter parameters
+    brightness: Optional[float] = Field(default=0.0)
+    contrast: Optional[float] = Field(default=1.0)
+    saturation: Optional[float] = Field(default=1.0)
+    temperature: Optional[float] = Field(default=0.0)
+    sharpen: Optional[float] = Field(default=0.0)
+    blur: Optional[float] = Field(default=0.0)
+    denoise: Optional[float] = Field(default=0.0)
+    vignette: Optional[float] = Field(default=0.0)
+    s_curve_contrast: Optional[float] = Field(default=0.0)
+    film_grain_strength: Optional[float] = Field(default=0.0)
+    
+    # Export parameters
+    export_format: Optional[str] = Field(default="MP4")
+    export_quality: Optional[int] = Field(default=85)
+    export_max_width: Optional[int] = Field(default=1024)
+
+class WorkflowPresetData(BaseModel):
+    """Complete workflow preset data"""
+    active_steps: List[str] = Field(
+        default=[],
+        description="List of active pipeline steps: 'upscale', 'interpolate', 'loop', 'filters', 'export'"
+    )
+    params: WorkflowPresetParams = Field(default_factory=WorkflowPresetParams)
+
+class SaveWorkflowPresetRequest(BaseModel):
+    """Request model for saving a workflow preset"""
+    name: str = Field(..., min_length=1, description="Name for the workflow preset")
+    preset_data: WorkflowPresetData
+
+class WorkflowPresetResponse(BaseModel):
+    """Response model for workflow preset operations"""
+    success: bool
+    message: str
+    preset_name: Optional[str] = None
+
+class ListWorkflowPresetsResponse(BaseModel):
+    """Response model for listing workflow presets"""
+    success: bool
+    presets: Dict[str, Any]
+    message: str
+
+# --- System Utility Request/Response Models ---
+class ClearTempResponse(BaseModel):
+    """Response model for clearing temporary files"""
+    success: bool
+    message: str
+    files_deleted: Optional[int] = None
+    space_freed_mb: Optional[float] = None
+
+class SystemStatusResponse(BaseModel):
+    """Response model for system status"""
+    success: bool
+    message: str
+    ram: Optional[Dict[str, Any]] = None
+    vram: Optional[Dict[str, Any]] = None
+    gpu: Optional[Dict[str, Any]] = None
+
+
+# ============================================================================
+# PHASE 4: FILTER PRESETS, BATCH PROCESSING, MODEL MANAGEMENT
+# ============================================================================
+
+# --- Filter Preset Request/Response Models ---
+class FilterPresetSettings(BaseModel):
+    """Filter settings for a preset"""
+    brightness: float = Field(default=0.0)
+    contrast: float = Field(default=1.0)
+    saturation: float = Field(default=1.0)
+    temperature: float = Field(default=0.0)
+    sharpen: float = Field(default=0.0)
+    blur: float = Field(default=0.0)
+    denoise: float = Field(default=0.0)
+    vignette: float = Field(default=0.0)
+    s_curve_contrast: float = Field(default=0.0)
+    film_grain_strength: float = Field(default=0.0)
+
+class SaveFilterPresetRequest(BaseModel):
+    """Request model for saving a filter preset"""
+    name: str = Field(..., min_length=1, description="Name for the filter preset")
+    settings: FilterPresetSettings
+
+class FilterPresetResponse(BaseModel):
+    """Response model for filter preset operations"""
+    success: bool
+    message: str
+    preset_name: Optional[str] = None
+
+class ListFilterPresetsResponse(BaseModel):
+    """Response model for listing filter presets"""
+    success: bool
+    presets: Dict[str, Any]
+    message: str
+
+# --- Batch Processing Request/Response Models ---
+class BatchVideoItem(BaseModel):
+    """A single video in a batch"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+
+class BatchProcessingRequest(BaseModel):
+    """Request model for batch processing multiple videos"""
+    videos: List[BatchVideoItem] = Field(
+        ...,
+        min_items=1,
+        description="List of videos to process (at least 1)"
+    )
+    operations: List[PipelineOperation] = Field(
+        ...,
+        min_items=1,
+        description="Pipeline operations to apply to each video"
+    )
+    callback_url: Optional[str] = Field(
+        default=None,
+        description="URL to POST results to when processing completes (webhook)"
+    )
+
+class BatchVideoResult(BaseModel):
+    """Result for a single video in batch processing"""
+    index: int
+    success: bool
+    input_source: str
+    output_video_base64: Optional[str] = None
+    output_path: Optional[str] = None
+    error: Optional[str] = None
+
+class BatchProcessingResponse(BaseModel):
+    """Response model for batch processing"""
+    success: bool
+    message: str
+    total_videos: int
+    successful: int
+    failed: int
+    results: List[BatchVideoResult]
+
+# --- Video Save Request/Response Models ---
+class SaveVideoRequest(BaseModel):
+    """Request model for saving a video to permanent storage"""
+    video_url: Optional[str] = Field(default=None, description="URL to the video file")
+    video_base64: Optional[str] = Field(default=None, description="Base64-encoded video data")
+    custom_name: Optional[str] = Field(default=None, description="Custom filename (optional)")
+
+class SaveVideoResponse(BaseModel):
+    """Response model for saving a video"""
+    success: bool
+    message: str
+    saved_path: Optional[str] = None
+    filename: Optional[str] = None
+
+# --- Autosave Mode Request/Response Models ---
+class AutosaveSettingRequest(BaseModel):
+    """Request model for setting autosave mode"""
+    enabled: bool = Field(..., description="Whether autosave should be enabled")
+
+class AutosaveSettingResponse(BaseModel):
+    """Response model for autosave mode"""
+    success: bool
+    message: str
+    autosave_enabled: bool
+
+# --- Model Unload Request/Response Models ---
+class UnloadMainModelResponse(BaseModel):
+    """Response model for unloading the main generation model"""
+    success: bool
+    message: str
+    model_unloaded: Optional[str] = None
+    vram_freed_estimate: Optional[str] = None
+
 
 # --- 13. REQUEST/RESPONSE MODELS ---
 
@@ -532,6 +1199,65 @@ async def download_image_from_url(url: str) -> np.ndarray:
         raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
 
 
+def download_file_from_url(url: str, allowed_extensions: list = None) -> str:
+    """Download a file from URL and return the local file path.
+    
+    Args:
+        url: The URL to download from
+        allowed_extensions: List of allowed file extensions (e.g. ['.mp4', '.webm'])
+        
+    Returns:
+        Path to the downloaded file
+    """
+    from urllib.parse import urlparse, unquote
+    
+    logger.info(f"[DOWNLOAD] Downloading file from URL: {url[:100]}...")
+    
+    try:
+        # Parse URL to get filename
+        parsed_url = urlparse(url)
+        url_path = unquote(parsed_url.path)
+        filename = os.path.basename(url_path) or f"downloaded_{uuid.uuid4().hex[:8]}"
+        
+        # Get extension
+        _, ext = os.path.splitext(filename)
+        if not ext:
+            ext = '.mp4'  # Default extension
+        
+        # Validate extension if list provided
+        if allowed_extensions and ext.lower() not in [e.lower() for e in allowed_extensions]:
+            logger.warning(f"[DOWNLOAD] Extension {ext} not in allowed list, defaulting to .mp4")
+            ext = '.mp4'
+        
+        # Create temp file path
+        temp_path = os.path.join(api_output_dir, f"download_{uuid.uuid4().hex[:8]}{ext}")
+        
+        # Download the file
+        response = requests.get(url, stream=True, timeout=120)
+        response.raise_for_status()
+        
+        # Write to file
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        file_size = os.path.getsize(temp_path)
+        logger.info(f"[DOWNLOAD] File downloaded successfully: {temp_path} ({file_size} bytes)")
+        
+        return temp_path
+        
+    except requests.exceptions.Timeout:
+        logger.error("[DOWNLOAD] Request timed out")
+        raise HTTPException(status_code=408, detail="File download timed out")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[DOWNLOAD] Request error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+    except Exception as e:
+        logger.error(f"[DOWNLOAD] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
+
+
 def apply_bucket_resolution(width: int, height: int) -> tuple:
     """Apply bucket resolution system like Gradio does.
     
@@ -662,6 +1388,3001 @@ async def list_loras(x_api_key: str = Header(None)):
         "loras": [l for l in lora_names if l != DUMMY_LORA_NAME],
         "lora_dir": lora_dir
     }
+
+
+# --- 16.5 AI FEATURES ENDPOINTS (Phase 1) ---
+
+@app.post("/enhance-prompt", response_model=EnhancePromptResponse, tags=["AI Features"])
+async def enhance_prompt_endpoint(req: EnhancePromptRequest, x_api_key: str = Header(None)):
+    """
+    Enhance a simple prompt into a detailed video generation prompt using AI.
+    
+    Uses the IBM Granite 3.3-2b-instruct model to expand and improve prompts
+    with better visual descriptions, motion details, and camera work.
+    
+    Supports both simple prompts and timestamped formats like:
+    - Simple: "A cat playing"
+    - Timestamped: "[1s: A cat sits] [3s: The cat jumps] [5s: The cat runs]"
+    
+    Note: First call may take longer as the model loads into memory.
+    
+    Optionally provide callback_url to receive results via webhook.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[AI] Enhance prompt request received. Prompt length: {len(req.prompt)} chars")
+    logger.info(f"[AI] Original prompt preview: {req.prompt[:100]}...")
+    
+    try:
+        # Call the enhance_prompt function from llm_enhancer.py
+        enhanced = enhance_prompt(req.prompt)
+        
+        logger.info(f"[AI] Prompt enhanced successfully. Enhanced length: {len(enhanced)} chars")
+        logger.info(f"[AI] Enhanced prompt preview: {enhanced[:100]}...")
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="enhance_prompt",
+                success=True,
+                metadata={
+                    "original_prompt": req.prompt,
+                    "enhanced_prompt": enhanced,
+                    "original_length": len(req.prompt),
+                    "enhanced_length": len(enhanced)
+                }
+            )
+        
+        return EnhancePromptResponse(
+            success=True,
+            original_prompt=req.prompt,
+            enhanced_prompt=enhanced,
+            message="Prompt enhanced successfully"
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to enhance prompt: {str(e)}"
+        logger.error(f"[AI] {error_msg}")
+        logger.error(f"[AI] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="enhance_prompt",
+                success=False,
+                error=error_msg,
+                metadata={"original_prompt": req.prompt}
+            )
+        
+        # Return original prompt on failure with error message
+        return EnhancePromptResponse(
+            success=False,
+            original_prompt=req.prompt,
+            enhanced_prompt=req.prompt,  # Return original on failure
+            message=error_msg
+        )
+
+
+@app.post("/caption-image", response_model=CaptionImageResponse, tags=["AI Features"])
+async def caption_image_endpoint(req: CaptionImageRequest, x_api_key: str = Header(None)):
+    """
+    Generate a detailed caption/description from an image using AI.
+    
+    Uses Microsoft's Florence-2-large model to analyze the image and
+    produce a detailed description suitable for use as a video generation prompt.
+    
+    Provide either:
+    - image_base64: Base64 encoded image data
+    - image_url: URL to download image from
+    
+    Note: First call may take longer as the model loads into memory.
+    
+    Optionally provide callback_url to receive results via webhook.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[AI] Caption image request received")
+    
+    image_source = "base64" if req.image_base64 else (req.image_url[:50] if req.image_url else "none")
+    
+    try:
+        # Get the image as numpy array
+        if req.image_base64:
+            logger.info("[AI] Decoding base64 image for captioning...")
+            image_np = decode_base64_image(req.image_base64)
+            logger.info(f"[AI] Image decoded successfully. Shape: {image_np.shape}")
+        elif req.image_url:
+            logger.info(f"[AI] Downloading image from URL: {req.image_url[:50]}...")
+            image_np = await download_image_from_url(req.image_url)
+            logger.info(f"[AI] Image downloaded successfully. Shape: {image_np.shape}")
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="Either image_base64 or image_url must be provided"
+            )
+        
+        # Call the caption_image function from llm_captioner.py
+        logger.info("[AI] Generating caption...")
+        caption = caption_image(image_np)
+        
+        logger.info(f"[AI] Caption generated successfully. Length: {len(caption)} chars")
+        logger.info(f"[AI] Caption preview: {caption[:100]}...")
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="caption_image",
+                success=True,
+                metadata={
+                    "caption": caption,
+                    "caption_length": len(caption),
+                    "image_source": image_source,
+                    "image_shape": list(image_np.shape) if image_np is not None else None
+                }
+            )
+        
+        return CaptionImageResponse(
+            success=True,
+            caption=caption,
+            message="Image captioned successfully"
+        )
+        
+    except HTTPException:
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="caption_image",
+                success=False,
+                error="HTTP error during captioning",
+                metadata={"image_source": image_source}
+            )
+        raise  # Re-raise HTTP exceptions as-is
+    except Exception as e:
+        error_msg = f"Failed to caption image: {str(e)}"
+        logger.error(f"[AI] {error_msg}")
+        logger.error(f"[AI] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="caption_image",
+                success=False,
+                error=error_msg,
+                metadata={"image_source": image_source}
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/ai/unload", response_model=UnloadModelResponse, tags=["AI Features"])
+async def unload_ai_models(req: UnloadModelRequest, x_api_key: str = Header(None)):
+    """
+    Unload AI models from memory to free up VRAM/RAM.
+    
+    Available models to unload:
+    - 'enhancer': Unload the prompt enhancement model (Granite 3.3-2b)
+    - 'captioner': Unload the image captioning model (Florence-2)
+    - 'all': Unload all AI models
+    
+    Use this when you need to free up memory for video generation
+    or when AI features are no longer needed.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[AI] Unload request received for model: {req.model}")
+    
+    models_unloaded = []
+    
+    try:
+        if req.model.lower() in ['enhancer', 'all']:
+            logger.info("[AI] Unloading prompt enhancer model...")
+            unload_enhancing_model()
+            models_unloaded.append('enhancer')
+            logger.info("[AI] Prompt enhancer model unloaded")
+        
+        if req.model.lower() in ['captioner', 'all']:
+            logger.info("[AI] Unloading image captioner model...")
+            unload_captioning_model()
+            models_unloaded.append('captioner')
+            logger.info("[AI] Image captioner model unloaded")
+        
+        if not models_unloaded:
+            return UnloadModelResponse(
+                success=False,
+                message=f"Unknown model: {req.model}. Use 'enhancer', 'captioner', or 'all'",
+                models_unloaded=[]
+            )
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return UnloadModelResponse(
+            success=True,
+            message=f"Successfully unloaded {len(models_unloaded)} model(s)",
+            models_unloaded=models_unloaded
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to unload models: {str(e)}"
+        logger.error(f"[AI] {error_msg}")
+        logger.error(f"[AI] Traceback: {traceback.format_exc()}")
+        
+        return UnloadModelResponse(
+            success=False,
+            message=error_msg,
+            models_unloaded=models_unloaded  # Return what was unloaded before error
+        )
+
+
+@app.get("/ai/status", tags=["AI Features"])
+async def get_ai_status(x_api_key: str = Header(None)):
+    """
+    Check the status of AI models (whether they are loaded in memory).
+    
+    Returns information about:
+    - enhancer_loaded: Whether the prompt enhancement model is in memory
+    - captioner_loaded: Whether the image captioning model is in memory
+    """
+    validate_api_key(x_api_key)
+    
+    # Check if models are loaded by inspecting the module globals
+    from modules import llm_enhancer, llm_captioner
+    
+    enhancer_loaded = llm_enhancer.model is not None
+    captioner_loaded = llm_captioner.model is not None
+    
+    return {
+        "enhancer": {
+            "loaded": enhancer_loaded,
+            "model_name": "ibm-granite/granite-3.3-2b-instruct" if enhancer_loaded else None
+        },
+        "captioner": {
+            "loaded": captioner_loaded,
+            "model_name": "microsoft/Florence-2-large" if captioner_loaded else None
+        }
+    }
+
+
+# ============================================================================
+# POST-PROCESSING ENDPOINTS (Toolbox Features)
+# ============================================================================
+
+@app.get("/postprocess/models", tags=["Post-Processing"])
+async def get_upscale_models(x_api_key: str = Header(None)):
+    """
+    Get a list of available upscaling models.
+    
+    Returns all Real-ESRGAN models available for video upscaling with descriptions.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[POST-PROCESS] Fetching available upscale models")
+    
+    models = {
+        "RealESRGAN_x2plus": {
+            "name": "RealESRGAN x2plus",
+            "scale": 2,
+            "description": "2x upscaling - Fast, general purpose"
+        },
+        "RealESRGAN_x4plus": {
+            "name": "RealESRGAN x4plus", 
+            "scale": 4,
+            "description": "4x upscaling - Sharp, detailed output"
+        },
+        "RealESRNet_x4plus": {
+            "name": "RealESRNet x4plus",
+            "scale": 4,
+            "description": "4x upscaling - Smoother, natural output"
+        },
+        "RealESR-general-x4v3": {
+            "name": "RealESR-general-x4v3",
+            "scale": 4,
+            "description": "4x upscaling - With denoise support"
+        },
+        "RealESRGAN_x4plus_anime_6B": {
+            "name": "RealESRGAN x4plus Anime 6B",
+            "scale": 4,
+            "description": "4x upscaling - Optimized for anime"
+        },
+        "RealESR_AnimeVideo_v3": {
+            "name": "RealESR AnimeVideo v3",
+            "scale": 4,
+            "description": "4x upscaling - Anime video specialized"
+        }
+    }
+    
+    return {"models": models}
+
+
+@app.get("/postprocess/presets", tags=["Post-Processing"])
+async def get_filter_presets(x_api_key: str = Header(None)):
+    """
+    Get a list of available video filter presets.
+    
+    Returns all predefined filter presets that can be applied to videos.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[POST-PROCESS] Fetching available filter presets")
+    
+    # Return the presets from toolbox_app
+    presets = tb_filter_presets_data if tb_filter_presets_data else {}
+    
+    return {"presets": presets}
+
+
+@app.post("/postprocess/analyze", response_model=AnalyzeVideoResponse, tags=["Post-Processing"])
+async def analyze_video(req: AnalyzeVideoRequest, x_api_key: str = Header(None)):
+    """
+    Analyze a video file to get its properties.
+    
+    Returns video metadata including:
+    - Duration, FPS, resolution
+    - File size, codec information
+    - Frame count
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[POST-PROCESS] Video analysis request received")
+    
+    # Validate input - must have exactly one source
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for analysis")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    if has_base64 and has_url:
+        logger.warning("[POST-PROCESS] Both video sources provided, using video_url")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL: {req.video_url[:100]}...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"analyze_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Analyzing video: {temp_video_path}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor analyze method
+        result = tb_processor.tb_analyze_video_input(temp_video_path)
+        
+        if result is None:
+            logger.error("[POST-PROCESS] Analysis returned no data")
+            raise HTTPException(status_code=500, detail="Failed to analyze video")
+        
+        logger.info(f"[POST-PROCESS] Analysis complete")
+        
+        # tb_analyze_video_input returns a formatted string with all video info
+        return AnalyzeVideoResponse(
+            success=True,
+            message="Video analyzed successfully",
+            analysis=result
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to analyze video: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp file if we created one from base64
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/upscale", response_model=UpscaleVideoResponse, tags=["Post-Processing"])
+async def upscale_video(req: UpscaleVideoRequest, x_api_key: str = Header(None)):
+    """
+    Upscale a video using Real-ESRGAN models.
+    
+    Available models:
+    - RealESRGAN_x2plus: 2x upscaling (fast, general purpose)
+    - RealESRGAN_x4plus: 4x upscaling (sharp output)
+    - RealESRNet_x4plus: 4x upscaling (smoother output)
+    - RealESR-general-x4v3: 4x with denoise support
+    - RealESRGAN_x4plus_anime_6B: 4x for anime
+    - RealESR_AnimeVideo_v3: 4x anime video specialized
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Upscale request: model={req.model}, scale={req.scale_factor}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for upscaling")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    # Validate model
+    valid_models = ["RealESRGAN_x2plus", "RealESRGAN_x4plus", "RealESRNet_x4plus", 
+                    "RealESR-general-x4v3", "RealESRGAN_x4plus_anime_6B", "RealESR_AnimeVideo_v3"]
+    if req.model not in valid_models:
+        logger.error(f"[POST-PROCESS] Invalid model: {req.model}")
+        raise HTTPException(status_code=400, detail=f"Invalid model. Valid models: {valid_models}")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for upscaling...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for upscaling...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"upscale_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Starting upscale: {temp_video_path}")
+        logger.info(f"[POST-PROCESS] Upscale params: model={req.model}, scale={req.scale_factor}, tile={req.tile_size}, face={req.enhance_face}, denoise={req.denoise_strength}, streaming={req.use_streaming}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor upscale method
+        # Method signature: tb_upscale_video(video_path, model_key, output_scale_factor_ui, tile_size, enhance_face, denoise_strength_ui, use_streaming)
+        output_path = tb_processor.tb_upscale_video(
+            video_path=temp_video_path,
+            model_key=req.model,
+            output_scale_factor_ui=req.scale_factor,
+            tile_size=req.tile_size,
+            enhance_face=req.enhance_face,
+            denoise_strength_ui=req.denoise_strength,
+            use_streaming=req.use_streaming
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Upscale failed - no output produced")
+            raise HTTPException(status_code=500, detail="Upscale failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Upscale complete: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="upscale",
+                success=True,
+                output_path=output_path,
+                output_base64=output_base64,
+                metadata={
+                    "model": req.model,
+                    "scale_factor": req.scale_factor,
+                    "tile_size": req.tile_size,
+                    "enhance_face": req.enhance_face,
+                    "denoise_strength": req.denoise_strength
+                }
+            )
+        
+        return UpscaleVideoResponse(
+            success=True,
+            message="Video upscaled successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        # Send failure callback
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="upscale",
+                success=False,
+                error="Request validation or HTTP error"
+            )
+        raise
+    except Exception as e:
+        error_msg = f"Failed to upscale video: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send failure callback
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation_type="upscale",
+                success=False,
+                error=error_msg
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file if we created one from base64
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/interpolate", response_model=InterpolateVideoResponse, tags=["Post-Processing"])
+async def interpolate_video(req: InterpolateVideoRequest, x_api_key: str = Header(None)):
+    """
+    Interpolate video frames using RIFE to increase smoothness.
+    
+    FPS modes:
+    - "2x": Double the frame rate
+    - "4x": Quadruple the frame rate
+    
+    Speed factor: Adjust playback speed (1.0 = normal, 0.5 = half speed, 2.0 = double speed)
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Interpolation request: fps_mode={req.fps_mode}, speed={req.speed_factor}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for interpolation")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    # Validate and normalize fps_mode - accept multiple formats for flexibility
+    # Map API formats to what the toolbox processor expects
+    fps_mode_mapping = {
+        "2x": "2x Frames",
+        "4x": "4x Frames",
+        "2x Frames": "2x Frames",
+        "4x Frames": "4x Frames",
+        "No Interpolation": "No Interpolation",
+        "none": "No Interpolation"
+    }
+    normalized_fps_mode = fps_mode_mapping.get(req.fps_mode)
+    if normalized_fps_mode is None:
+        logger.error(f"[POST-PROCESS] Invalid fps_mode: {req.fps_mode}")
+        raise HTTPException(status_code=400, detail=f"fps_mode must be one of: {list(fps_mode_mapping.keys())}")
+    
+    logger.info(f"[POST-PROCESS] FPS mode normalized: '{req.fps_mode}' -> '{normalized_fps_mode}'")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for interpolation...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for interpolation...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"interpolate_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Starting interpolation: {temp_video_path}")
+        logger.info(f"[POST-PROCESS] Interpolate params: fps_mode={normalized_fps_mode}, speed={req.speed_factor}, streaming={req.use_streaming}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor interpolation method
+        # Method signature: tb_process_frames(video_path, target_fps_mode, speed_factor, use_streaming)
+        output_path = tb_processor.tb_process_frames(
+            video_path=temp_video_path,
+            target_fps_mode=normalized_fps_mode,
+            speed_factor=req.speed_factor,
+            use_streaming=req.use_streaming
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Interpolation failed - no output produced")
+            raise HTTPException(status_code=500, detail="Interpolation failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Interpolation complete: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="interpolate",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Video interpolated successfully",
+                metadata={
+                    "fps_mode": req.fps_mode,
+                    "speed_factor": req.speed_factor,
+                    "use_streaming": req.use_streaming
+                }
+            )
+        
+        return InterpolateVideoResponse(
+            success=True,
+            message="Video interpolated successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to interpolate video: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="interpolate",
+                success=False,
+                error=error_msg,
+                message="Interpolation failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/filters", response_model=VideoFiltersResponse, tags=["Post-Processing"])
+async def apply_video_filters(req: VideoFiltersRequest, x_api_key: str = Header(None)):
+    """
+    Apply visual filters to a video using FFmpeg.
+    
+    Filter parameters (all default to 0.0 for no change):
+    - brightness: -1.0 to 1.0 (darker to brighter)
+    - contrast: -1.0 to 1.0 (less to more contrast)
+    - saturation: -1.0 to 1.0 (desaturated to oversaturated)
+    - temperature: -1.0 to 1.0 (cooler to warmer)
+    - sharpen: 0.0 to 1.0 (no sharpen to max sharpen)
+    - blur: 0.0 to 1.0 (no blur to max blur)
+    - denoise: 0.0 to 1.0 (no denoise to max denoise)
+    - vignette: 0.0 to 1.0 (no vignette to max vignette)
+    - s_curve_contrast: 0.0 to 1.0 (cinematic contrast curve)
+    - film_grain: 0.0 to 1.0 (film grain effect)
+    
+    Or use a preset name to apply predefined filter settings.
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Filters request: preset={req.preset}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for filters")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for filters...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for filters...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"filters_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Applying filters to: {temp_video_path}")
+        logger.info(f"[POST-PROCESS] Filter params: brightness={req.brightness}, contrast={req.contrast}, saturation={req.saturation}, temperature={req.temperature}")
+        logger.info(f"[POST-PROCESS] Filter params: sharpen={req.sharpen}, blur={req.blur}, denoise={req.denoise}, vignette={req.vignette}")
+        logger.info(f"[POST-PROCESS] Filter params: s_curve={req.s_curve_contrast}, film_grain={req.film_grain}, preset={req.preset}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor filters method
+        # Method signature: tb_apply_filters(video_path, brightness, contrast, saturation, temperature, sharpen, blur, denoise, vignette, s_curve_contrast, film_grain_strength)
+        output_path = tb_processor.tb_apply_filters(
+            video_path=temp_video_path,
+            brightness=req.brightness,
+            contrast=req.contrast,
+            saturation=req.saturation,
+            temperature=req.temperature,
+            sharpen=req.sharpen,
+            blur=req.blur,
+            denoise=req.denoise,
+            vignette=req.vignette,
+            s_curve_contrast=req.s_curve_contrast,
+            film_grain_strength=req.film_grain
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Filters failed - no output produced")
+            raise HTTPException(status_code=500, detail="Filters failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Filters applied: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="filters",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Filters applied successfully",
+                metadata={
+                    "preset": req.preset,
+                    "brightness": req.brightness,
+                    "contrast": req.contrast,
+                    "saturation": req.saturation,
+                    "temperature": req.temperature,
+                    "sharpen": req.sharpen,
+                    "blur": req.blur,
+                    "denoise": req.denoise,
+                    "vignette": req.vignette,
+                    "s_curve_contrast": req.s_curve_contrast,
+                    "film_grain": req.film_grain
+                }
+            )
+        
+        return VideoFiltersResponse(
+            success=True,
+            message="Filters applied successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to apply filters: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="filters",
+                success=False,
+                error=error_msg,
+                message="Filters failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/loop", response_model=VideoLoopResponse, tags=["Post-Processing"])
+async def create_video_loop(req: VideoLoopRequest, x_api_key: str = Header(None)):
+    """
+    Create a looping video.
+    
+    Loop types:
+    - "loop": Simple loop - video plays forward repeatedly
+    - "ping-pong": Video plays forward then backward (seamless loop)
+    
+    num_loops: Number of times to loop (1-10)
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Loop request: type={req.loop_type}, num_loops={req.num_loops}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for loop")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    # Validate loop_type - also support 'none' for no-op (matches Gradio)
+    valid_loop_types = ["loop", "ping-pong", "none"]
+    if req.loop_type not in valid_loop_types:
+        logger.error(f"[POST-PROCESS] Invalid loop_type: {req.loop_type}")
+        raise HTTPException(status_code=400, detail=f"loop_type must be one of: {valid_loop_types}")
+    
+    # Handle 'none' loop type as no-op - return original video
+    if req.loop_type == "none":
+        logger.info("[POST-PROCESS] Loop type is 'none' - returning original video without modification")
+        # Still need to get the video for response
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for loop...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for loop...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"loop_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Creating loop: {temp_video_path}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor loop method
+        # Method signature: tb_create_loop(video_path, loop_type, num_loops)
+        output_path = tb_processor.tb_create_loop(
+            video_path=temp_video_path,
+            loop_type=req.loop_type,
+            num_loops=req.num_loops
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Loop failed - no output produced")
+            raise HTTPException(status_code=500, detail="Loop creation failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Loop created: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="loop",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Loop created successfully",
+                metadata={
+                    "loop_type": req.loop_type,
+                    "num_loops": req.num_loops
+                }
+            )
+        
+        return VideoLoopResponse(
+            success=True,
+            message="Loop created successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to create loop: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="loop",
+                success=False,
+                error=error_msg,
+                message="Loop creation failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/join", response_model=JoinVideosResponse, tags=["Post-Processing"])
+async def join_videos(req: JoinVideosRequest, x_api_key: str = Header(None)):
+    """
+    Join multiple videos into a single video.
+    
+    Provide a list of video URLs to concatenate in order.
+    Videos should have compatible resolutions and codecs for best results.
+    
+    Optional: Specify output_name for the resulting file.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Join request: {len(req.video_urls)} videos")
+    
+    # Validate input
+    if not req.video_urls or len(req.video_urls) < 2:
+        logger.error("[POST-PROCESS] Need at least 2 videos to join")
+        raise HTTPException(status_code=400, detail="At least 2 video URLs are required")
+    
+    temp_video_paths = []
+    
+    try:
+        # Download all videos
+        for i, url in enumerate(req.video_urls):
+            logger.info(f"[POST-PROCESS] Downloading video {i+1}/{len(req.video_urls)}...")
+            video_path = download_file_from_url(url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+            temp_video_paths.append(video_path)
+        
+        logger.info(f"[POST-PROCESS] Joining {len(temp_video_paths)} videos")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor join method
+        # Method signature: tb_join_videos(video_paths, output_base_name_override)
+        output_path = tb_processor.tb_join_videos(
+            video_paths=temp_video_paths,
+            output_base_name_override=req.output_name
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Join failed - no output produced")
+            raise HTTPException(status_code=500, detail="Join failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Videos joined: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="join",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Videos joined successfully",
+                metadata={
+                    "num_videos": len(req.video_urls),
+                    "output_name": req.output_name
+                }
+            )
+        
+        return JoinVideosResponse(
+            success=True,
+            message="Videos joined successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to join videos: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="join",
+                success=False,
+                error=error_msg,
+                message="Join videos failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input files
+        for path in temp_video_paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    logger.debug(f"[POST-PROCESS] Cleaned up temp file: {path}")
+                except Exception as e:
+                    logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/export", response_model=ExportVideoResponse, tags=["Post-Processing"])
+async def export_video(req: ExportVideoRequest, x_api_key: str = Header(None)):
+    """
+    Export/convert a video to a different format with quality settings.
+    
+    Formats:
+    - "MP4": Standard MP4 (H.264)
+    - "WebM": WebM format (VP9)
+    - "GIF": Animated GIF
+    
+    Quality: 1-100 (higher = better quality, larger file)
+    max_width: Optional maximum width (preserves aspect ratio)
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Export request: format={req.format}, quality={req.quality}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for export")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    # Validate format
+    if req.format not in ["MP4", "WebM", "GIF"]:
+        logger.error(f"[POST-PROCESS] Invalid format: {req.format}")
+        raise HTTPException(status_code=400, detail="format must be 'MP4', 'WebM', or 'GIF'")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for export...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv', '.gif'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for export...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"export_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        logger.info(f"[POST-PROCESS] Exporting: {temp_video_path} -> {req.format}")
+        logger.info(f"[POST-PROCESS] Export params: quality={req.quality}, max_width={req.max_width}")
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Call the toolbox processor export method
+        # Method signature: tb_export_video(video_path, export_format, quality_slider, max_width, output_base_name_override)
+        output_path = tb_processor.tb_export_video(
+            video_path=temp_video_path,
+            export_format=req.format,
+            quality_slider=req.quality,
+            max_width=req.max_width or 1920,  # Default max width
+            output_base_name_override=req.output_name
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[POST-PROCESS] Export failed - no output produced")
+            raise HTTPException(status_code=500, detail="Export failed - check server logs for details")
+        
+        logger.info(f"[POST-PROCESS] Export complete: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="export",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Video exported successfully",
+                metadata={
+                    "format": req.format,
+                    "quality": req.quality,
+                    "max_width": req.max_width,
+                    "output_name": req.output_name
+                }
+            )
+        
+        return ExportVideoResponse(
+            success=True,
+            message="Video exported successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to export video: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="export",
+                success=False,
+                error=error_msg,
+                message="Export failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+
+
+@app.post("/postprocess/pipeline", response_model=PipelineResponse, tags=["Post-Processing"])
+async def run_pipeline(req: PipelineRequest, x_api_key: str = Header(None)):
+    """
+    Run a pipeline of multiple post-processing operations on a video.
+    
+    Operations are executed in order. Each operation can be:
+    - "upscale": Upscale with Real-ESRGAN
+    - "interpolate": Frame interpolation with RIFE
+    - "filters": Apply visual filters
+    - "loop": Create loop
+    - "export": Export to format
+    
+    Example operations array:
+    [
+        {"type": "upscale", "params": {"model": "RealESRGAN_x2plus"}},
+        {"type": "interpolate", "params": {"fps_mode": "2x"}},
+        {"type": "export", "params": {"format": "MP4", "quality": 90}}
+    ]
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[POST-PROCESS] Pipeline request: {len(req.operations)} operations")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[POST-PROCESS] No video source provided for pipeline")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    if not req.operations or len(req.operations) == 0:
+        logger.error("[POST-PROCESS] No operations provided for pipeline")
+        raise HTTPException(status_code=400, detail="At least one operation is required")
+    
+    # Validate operation types
+    valid_ops = ["upscale", "interpolate", "filters", "loop", "export"]
+    for op in req.operations:
+        if op.type not in valid_ops:
+            logger.error(f"[POST-PROCESS] Invalid operation type: {op.type}")
+            raise HTTPException(status_code=400, detail=f"Invalid operation type: {op.type}. Valid types: {valid_ops}")
+    
+    temp_video_path = None
+    current_video_path = None
+    intermediate_files = []
+    results = []
+    
+    try:
+        # Get video file path
+        if has_url:
+            logger.info(f"[POST-PROCESS] Downloading video from URL for pipeline...")
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
+        else:
+            logger.info("[POST-PROCESS] Decoding video from base64 for pipeline...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"pipeline_input_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        
+        current_video_path = temp_video_path
+        
+        # Check if toolbox processor is available
+        if tb_processor is None:
+            logger.error("[POST-PROCESS] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Execute each operation in sequence
+        for i, op in enumerate(req.operations):
+            logger.info(f"[POST-PROCESS] Pipeline step {i+1}/{len(req.operations)}: {op.type}")
+            
+            output_path = None
+            
+            if op.type == "upscale":
+                params = op.params or {}
+                output_path = tb_processor.tb_upscale_video(
+                    video_path=current_video_path,
+                    model_key=params.get("model", "RealESRGAN_x2plus"),
+                    output_scale_factor_ui=params.get("scale_factor", 2.0),
+                    tile_size=params.get("tile_size", 512),
+                    enhance_face=params.get("enhance_face", False),
+                    denoise_strength_ui=params.get("denoise_strength", 0.5),
+                    use_streaming=params.get("use_streaming", True)
+                )
+            
+            elif op.type == "interpolate":
+                params = op.params or {}
+                output_path = tb_processor.tb_process_frames(
+                    video_path=current_video_path,
+                    target_fps_mode=params.get("fps_mode", "2x"),
+                    speed_factor=params.get("speed_factor", 1.0),
+                    use_streaming=params.get("use_streaming", True)
+                )
+            
+            elif op.type == "filters":
+                params = op.params or {}
+                output_path = tb_processor.tb_apply_filters(
+                    video_path=current_video_path,
+                    brightness=params.get("brightness", 0.0),
+                    contrast=params.get("contrast", 1.0),
+                    saturation=params.get("saturation", 1.0),
+                    temperature=params.get("temperature", 0.0),
+                    sharpen=params.get("sharpen", 0.0),
+                    blur=params.get("blur", 0.0),
+                    denoise=params.get("denoise", 0.0),
+                    vignette=params.get("vignette", 0.0),
+                    s_curve_contrast=params.get("s_curve_contrast", 0.0),
+                    film_grain_strength=params.get("film_grain", 0.0)
+                )
+            
+            elif op.type == "loop":
+                params = op.params or {}
+                output_path = tb_processor.tb_create_loop(
+                    video_path=current_video_path,
+                    loop_type=params.get("loop_type", "loop"),
+                    num_loops=params.get("num_loops", 2)
+                )
+            
+            elif op.type == "export":
+                params = op.params or {}
+                output_path = tb_processor.tb_export_video(
+                    video_path=current_video_path,
+                    export_format=params.get("format", "MP4"),
+                    quality_slider=params.get("quality", 85),
+                    max_width=params.get("max_width") or 1920,
+                    output_base_name_override=params.get("output_name")
+                )
+            
+            # Check result
+            if output_path is None or not os.path.exists(output_path):
+                logger.error(f"[POST-PROCESS] Pipeline step {i+1} failed")
+                results.append({"step": i+1, "type": op.type, "success": False, "message": "Operation failed"})
+                raise HTTPException(status_code=500, detail=f"Pipeline step {i+1} ({op.type}) failed")
+            
+            results.append({"step": i+1, "type": op.type, "success": True, "message": "Operation completed"})
+            
+            # Track intermediate files for cleanup (but not the final output)
+            if current_video_path != temp_video_path and current_video_path != output_path:
+                intermediate_files.append(current_video_path)
+            
+            current_video_path = output_path
+            logger.info(f"[POST-PROCESS] Pipeline step {i+1} complete: {output_path}")
+        
+        logger.info(f"[POST-PROCESS] Pipeline complete: {current_video_path}")
+        
+        # Read final output and convert to base64
+        with open(current_video_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="pipeline",
+                success=True,
+                output_path=current_video_path,
+                output_video_base64=output_base64,
+                message=f"Pipeline completed successfully ({len(req.operations)} operations)",
+                metadata={
+                    "operations_count": len(req.operations),
+                    "operations_completed": results
+                }
+            )
+        
+        return PipelineResponse(
+            success=True,
+            message=f"Pipeline completed successfully ({len(req.operations)} operations)",
+            output_video_base64=output_base64,
+            output_path=current_video_path,
+            operations_completed=results
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Pipeline failed: {str(e)}"
+        logger.error(f"[POST-PROCESS] {error_msg}")
+        logger.error(f"[POST-PROCESS] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="pipeline",
+                success=False,
+                error=error_msg,
+                message="Pipeline failed",
+                metadata={
+                    "operations_completed": results
+                }
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp input file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[POST-PROCESS] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[POST-PROCESS] Failed to clean up temp file: {e}")
+        
+        # Clean up intermediate files
+        for path in intermediate_files:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    logger.debug(f"[POST-PROCESS] Cleaned up intermediate file: {path}")
+                except Exception as e:
+                    logger.warning(f"[POST-PROCESS] Failed to clean up intermediate file: {e}")
+
+
+# ============================================================================
+# PHASE 3: FRAMES STUDIO ENDPOINTS
+# ============================================================================
+
+@app.post("/frames/extract", response_model=ExtractFramesResponse, tags=["Frames Studio"])
+async def extract_frames(req: ExtractFramesRequest, x_api_key: str = Header(None)):
+    """
+    Extract frames from a video for frame-by-frame editing.
+    
+    Use this to:
+    - Extract all frames (extraction_rate=1)
+    - Extract every Nth frame to reduce frame count
+    
+    After extraction, use /frames/folders to find your extracted folder,
+    then /frames/{folder} to list and manage individual frames.
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Extract frames request: rate={req.extraction_rate}")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        logger.error("[FRAMES] No video source provided")
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    temp_video_path = None
+    
+    try:
+        # Get video to a temp file
+        if has_base64:
+            logger.info("[FRAMES] Decoding base64 video for extraction...")
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"temp_extract_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+            logger.info(f"[FRAMES] Temp video saved: {temp_video_path}")
+        else:
+            logger.info(f"[FRAMES] Downloading video from URL for extraction...")
+            temp_video_path = await download_file_from_url(req.video_url, api_output_dir)
+            logger.info(f"[FRAMES] Video downloaded: {temp_video_path}")
+        
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Call the toolbox processor extract method
+        # Method signature: tb_extract_frames(video_path, extraction_rate, progress)
+        logger.info(f"[FRAMES] Starting extraction with rate={req.extraction_rate}...")
+        output_folder = tb_processor.tb_extract_frames(
+            video_path=temp_video_path,
+            extraction_rate=req.extraction_rate
+        )
+        
+        if output_folder is None or not os.path.exists(output_folder):
+            logger.error("[FRAMES] Extraction failed - no output folder")
+            raise HTTPException(status_code=500, detail="Frame extraction failed - check server logs")
+        
+        # Count frames in the output folder
+        frame_files = [f for f in os.listdir(output_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        frame_count = len(frame_files)
+        folder_name = os.path.basename(output_folder)
+        
+        logger.info(f"[FRAMES] Extraction complete: {frame_count} frames in {folder_name}")
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="extract_frames",
+                success=True,
+                output_path=output_folder,
+                message=f"Successfully extracted {frame_count} frames",
+                metadata={
+                    "extraction_rate": req.extraction_rate,
+                    "folder_name": folder_name,
+                    "frame_count": frame_count
+                }
+            )
+        
+        return ExtractFramesResponse(
+            success=True,
+            message=f"Successfully extracted {frame_count} frames",
+            folder_name=folder_name,
+            frame_count=frame_count,
+            frames_path=output_folder
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to extract frames: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="extract_frames",
+                success=False,
+                error=error_msg,
+                message="Frame extraction failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp video file
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+                logger.debug(f"[FRAMES] Cleaned up temp file: {temp_video_path}")
+            except Exception as e:
+                logger.warning(f"[FRAMES] Failed to clean up temp file: {e}")
+
+
+@app.get("/frames/folders", response_model=FrameFoldersResponse, tags=["Frames Studio"])
+async def list_frame_folders(x_api_key: str = Header(None)):
+    """
+    List all extracted frame folders.
+    
+    Returns a list of folder names that can be used with other /frames/ endpoints.
+    Each folder represents a previous frame extraction operation.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[FRAMES] List folders request")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Get list of extracted frame folders
+        folders = tb_processor.tb_get_extracted_frame_folders()
+        
+        logger.info(f"[FRAMES] Found {len(folders)} folders")
+        
+        return FrameFoldersResponse(
+            success=True,
+            folders=folders,
+            message=f"Found {len(folders)} extracted frame folder(s)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to list folders: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/frames/{folder}", response_model=ListFramesResponse, tags=["Frames Studio"])
+async def list_frames_in_folder(folder: str, x_api_key: str = Header(None)):
+    """
+    List all frames in a specific extracted folder.
+    
+    Returns frame information including filename, path, and index.
+    Use this to browse frames before deletion or saving operations.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] List frames request for folder: {folder}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Get frames from the folder
+        frame_paths = tb_processor.tb_get_frames_from_folder(folder)
+        
+        if not frame_paths:
+            logger.warning(f"[FRAMES] No frames found in folder: {folder}")
+            return ListFramesResponse(
+                success=True,
+                folder=folder,
+                frames=[],
+                total_count=0,
+                message=f"No frames found in folder '{folder}'"
+            )
+        
+        # Build frame info list
+        frames = []
+        for i, path in enumerate(frame_paths):
+            frames.append(FrameInfo(
+                filename=os.path.basename(path),
+                path=path,
+                index=i
+            ))
+        
+        logger.info(f"[FRAMES] Found {len(frames)} frames in {folder}")
+        
+        return ListFramesResponse(
+            success=True,
+            folder=folder,
+            frames=frames,
+            total_count=len(frames),
+            message=f"Found {len(frames)} frame(s) in folder '{folder}'"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to list frames: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.delete("/frames/{folder}", response_model=DeleteFolderResponse, tags=["Frames Studio"])
+async def delete_frame_folder(folder: str, x_api_key: str = Header(None)):
+    """
+    Delete an entire extracted frames folder and all its contents.
+    
+    This is a destructive operation - all frames in the folder will be permanently deleted.
+    Use with caution!
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Delete folder request: {folder}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Delete the folder
+        success = tb_processor.tb_delete_extracted_frames_folder(folder)
+        
+        if success:
+            logger.info(f"[FRAMES] Successfully deleted folder: {folder}")
+            return DeleteFolderResponse(
+                success=True,
+                folder=folder,
+                message=f"Successfully deleted folder '{folder}' and all its contents"
+            )
+        else:
+            logger.error(f"[FRAMES] Failed to delete folder: {folder}")
+            return DeleteFolderResponse(
+                success=False,
+                folder=folder,
+                message=f"Failed to delete folder '{folder}' - check server logs"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to delete folder: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.delete("/frames/{folder}/{frame}", response_model=DeleteFrameResponse, tags=["Frames Studio"])
+async def delete_single_frame(folder: str, frame: str, x_api_key: str = Header(None)):
+    """
+    Delete a single frame from an extracted frames folder.
+    
+    Use this to remove bad or glitchy frames before reassembling the video.
+    The frame parameter should be the filename (e.g., "frame_000123.png").
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Delete frame request: {folder}/{frame}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Build the full path to the frame
+        frame_path = os.path.join(tb_processor.extracted_frames_target_path, folder, frame)
+        
+        if not os.path.exists(frame_path):
+            logger.error(f"[FRAMES] Frame not found: {frame_path}")
+            raise HTTPException(status_code=404, detail=f"Frame '{frame}' not found in folder '{folder}'")
+        
+        # Delete the frame
+        result = tb_processor.tb_delete_single_frame(frame_path)
+        
+        if "✅" in result or "Deleted" in result:
+            logger.info(f"[FRAMES] Successfully deleted frame: {frame}")
+            return DeleteFrameResponse(
+                success=True,
+                folder=folder,
+                frame=frame,
+                message=f"Successfully deleted frame '{frame}'"
+            )
+        else:
+            logger.error(f"[FRAMES] Failed to delete frame: {result}")
+            return DeleteFrameResponse(
+                success=False,
+                folder=folder,
+                frame=frame,
+                message=result
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to delete frame: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/frames/{folder}/save/{frame}", response_model=SaveFrameResponse, tags=["Frames Studio"])
+async def save_single_frame(folder: str, frame: str, x_api_key: str = Header(None)):
+    """
+    Save a single frame as a high-quality image to permanent storage.
+    
+    This copies the frame to the saved_videos directory with a timestamped filename.
+    Useful for extracting a good frame to use as an image prompt for generation.
+    
+    Returns both the saved path and the frame as base64.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Save frame request: {folder}/{frame}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Build the full path to the frame
+        frame_path = os.path.join(tb_processor.extracted_frames_target_path, folder, frame)
+        
+        if not os.path.exists(frame_path):
+            logger.error(f"[FRAMES] Frame not found: {frame_path}")
+            raise HTTPException(status_code=404, detail=f"Frame '{frame}' not found in folder '{folder}'")
+        
+        # Save the frame
+        saved_path = tb_processor.tb_save_single_frame(frame_path)
+        
+        if saved_path is None:
+            logger.error(f"[FRAMES] Failed to save frame: {frame}")
+            raise HTTPException(status_code=500, detail="Failed to save frame - check server logs")
+        
+        # Read frame and convert to base64
+        with open(saved_path, 'rb') as f:
+            frame_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        logger.info(f"[FRAMES] Successfully saved frame to: {saved_path}")
+        
+        return SaveFrameResponse(
+            success=True,
+            message=f"Successfully saved frame '{frame}'",
+            saved_path=saved_path,
+            frame_base64=frame_base64
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to save frame: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/frames/reassemble", response_model=ReassembleFramesResponse, tags=["Frames Studio"])
+async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Header(None)):
+    """
+    Reassemble extracted frames back into a video.
+    
+    After editing frames (deleting bad ones), use this to create a new video
+    from the remaining frames in a folder.
+    
+    The folder_name should match one from /frames/folders.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FRAMES] Reassemble request: folder={req.folder_name}, fps={req.output_fps}")
+    
+    try:
+        if tb_processor is None:
+            logger.error("[FRAMES] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Frames processing module not available")
+        
+        # Build the full path to the frames folder
+        frames_path = os.path.join(tb_processor.extracted_frames_target_path, req.folder_name)
+        
+        if not os.path.exists(frames_path) or not os.path.isdir(frames_path):
+            logger.error(f"[FRAMES] Folder not found: {frames_path}")
+            raise HTTPException(status_code=404, detail=f"Folder '{req.folder_name}' not found")
+        
+        # Reassemble frames to video
+        # Method signature: tb_reassemble_frames_to_video(frames_source, output_fps, output_base_name_override)
+        logger.info(f"[FRAMES] Starting reassembly from {frames_path}...")
+        output_path = tb_processor.tb_reassemble_frames_to_video(
+            frames_source=frames_path,
+            output_fps=req.output_fps,
+            output_base_name_override=req.output_name
+        )
+        
+        if output_path is None or not os.path.exists(output_path):
+            logger.error("[FRAMES] Reassembly failed - no output produced")
+            raise HTTPException(status_code=500, detail="Frame reassembly failed - check server logs")
+        
+        logger.info(f"[FRAMES] Reassembly complete: {output_path}")
+        
+        # Read output and convert to base64
+        with open(output_path, 'rb') as f:
+            output_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="reassemble_frames",
+                success=True,
+                output_path=output_path,
+                output_video_base64=output_base64,
+                message="Frames reassembled successfully",
+                metadata={
+                    "folder_name": req.folder_name,
+                    "output_fps": req.output_fps,
+                    "output_name": req.output_name
+                }
+            )
+        
+        return ReassembleFramesResponse(
+            success=True,
+            message="Frames reassembled successfully",
+            output_video_base64=output_base64,
+            output_path=output_path
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to reassemble frames: {str(e)}"
+        logger.error(f"[FRAMES] {error_msg}")
+        logger.error(f"[FRAMES] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="reassemble_frames",
+                success=False,
+                error=error_msg,
+                message="Frame reassembly failed"
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ============================================================================
+# PHASE 3: WORKFLOW PRESET ENDPOINTS
+# ============================================================================
+
+@app.get("/workflow/presets", response_model=ListWorkflowPresetsResponse, tags=["Workflow Presets"])
+async def list_workflow_presets(x_api_key: str = Header(None)):
+    """
+    List all available workflow presets.
+    
+    Workflow presets save complete pipeline configurations including:
+    - Active pipeline steps
+    - All parameter values for each step
+    
+    Use these to quickly apply saved processing workflows.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[WORKFLOW] List presets request")
+    
+    try:
+        # Refresh presets from file
+        _initialize_workflow_presets()
+        
+        logger.info(f"[WORKFLOW] Found {len(tb_workflow_presets_data)} presets")
+        
+        return ListWorkflowPresetsResponse(
+            success=True,
+            presets=tb_workflow_presets_data,
+            message=f"Found {len(tb_workflow_presets_data)} workflow preset(s)"
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to list presets: {str(e)}"
+        logger.error(f"[WORKFLOW] {error_msg}")
+        logger.error(f"[WORKFLOW] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/workflow/presets", response_model=WorkflowPresetResponse, tags=["Workflow Presets"])
+async def save_workflow_preset(req: SaveWorkflowPresetRequest, x_api_key: str = Header(None)):
+    """
+    Save a new workflow preset or update an existing one.
+    
+    Workflow presets include:
+    - active_steps: List of steps to enable (e.g., ["upscale", "interpolate", "export"])
+    - params: All parameter values for each processing step
+    
+    Use GET /workflow/presets to see the expected parameter structure.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[WORKFLOW] Save preset request: {req.name}")
+    
+    try:
+        global tb_workflow_presets_data
+        
+        clean_name = req.name.strip()
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Preset name cannot be empty")
+        
+        # Convert Pydantic model to dict
+        preset_data = {
+            "active_steps": req.preset_data.active_steps,
+            "params": req.preset_data.params.model_dump()
+        }
+        
+        preset_existed = clean_name in tb_workflow_presets_data
+        tb_workflow_presets_data[clean_name] = preset_data
+        
+        # Save to file
+        with open(TB_WORKFLOW_PRESETS_FILE, 'w') as f:
+            json.dump(tb_workflow_presets_data, f, indent=4)
+        
+        action = "updated" if preset_existed else "saved"
+        logger.info(f"[WORKFLOW] Preset '{clean_name}' {action} successfully")
+        
+        return WorkflowPresetResponse(
+            success=True,
+            message=f"Workflow preset '{clean_name}' {action} successfully",
+            preset_name=clean_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to save preset: {str(e)}"
+        logger.error(f"[WORKFLOW] {error_msg}")
+        logger.error(f"[WORKFLOW] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.delete("/workflow/presets/{name}", response_model=WorkflowPresetResponse, tags=["Workflow Presets"])
+async def delete_workflow_preset(name: str, x_api_key: str = Header(None)):
+    """
+    Delete a workflow preset by name.
+    
+    The "None" preset cannot be deleted as it represents default values.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[WORKFLOW] Delete preset request: {name}")
+    
+    try:
+        global tb_workflow_presets_data
+        
+        clean_name = name.strip()
+        
+        if clean_name == "None":
+            logger.warning("[WORKFLOW] Cannot delete 'None' preset")
+            raise HTTPException(status_code=400, detail="Cannot delete the 'None' preset - it represents default values")
+        
+        if clean_name not in tb_workflow_presets_data:
+            logger.warning(f"[WORKFLOW] Preset not found: {clean_name}")
+            raise HTTPException(status_code=404, detail=f"Preset '{clean_name}' not found")
+        
+        # Remove the preset
+        del tb_workflow_presets_data[clean_name]
+        
+        # Save to file
+        with open(TB_WORKFLOW_PRESETS_FILE, 'w') as f:
+            json.dump(tb_workflow_presets_data, f, indent=4)
+        
+        logger.info(f"[WORKFLOW] Preset '{clean_name}' deleted successfully")
+        
+        return WorkflowPresetResponse(
+            success=True,
+            message=f"Workflow preset '{clean_name}' deleted successfully",
+            preset_name=clean_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to delete preset: {str(e)}"
+        logger.error(f"[WORKFLOW] {error_msg}")
+        logger.error(f"[WORKFLOW] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ============================================================================
+# PHASE 3: SYSTEM UTILITY ENDPOINTS
+# ============================================================================
+
+@app.post("/system/clear-temp", response_model=ClearTempResponse, tags=["System Utilities"])
+async def clear_temporary_files(x_api_key: str = Header(None)):
+    """
+    Clear temporary files from the toolbox processing directories.
+    
+    This removes:
+    - Temporary video files from post-processing temp folder
+    - Gradio temp folder contents (matches Gradio UI behavior)
+    - API temp files (prefixed with temp_)
+    - Intermediate processing files
+    - Extracted frames that haven't been saved
+    
+    Use this to free up disk space after processing.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[SYSTEM] Clear temp files request")
+    
+    try:
+        files_deleted = 0
+        space_freed = 0
+        
+        # Helper function to clean a directory and track stats
+        def clean_directory(dir_path: str, description: str) -> tuple:
+            """Clean a directory and return (files_deleted, space_freed)"""
+            local_files = 0
+            local_space = 0
+            
+            if not dir_path or not os.path.exists(dir_path):
+                logger.debug(f"[SYSTEM] {description}: Path not found or not set - {dir_path}")
+                return 0, 0
+            
+            try:
+                items = os.listdir(dir_path)
+                if not items:
+                    logger.debug(f"[SYSTEM] {description}: Already empty")
+                    return 0, 0
+                
+                for item in items:
+                    item_path = os.path.join(dir_path, item)
+                    try:
+                        if os.path.isfile(item_path):
+                            local_space += os.path.getsize(item_path)
+                            os.remove(item_path)
+                            local_files += 1
+                            logger.debug(f"[SYSTEM] Deleted temp file: {item_path}")
+                        elif os.path.isdir(item_path):
+                            # Calculate folder size before deletion
+                            for root, dirs, files in os.walk(item_path):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    try:
+                                        local_space += os.path.getsize(file_path)
+                                        local_files += 1
+                                    except OSError:
+                                        pass
+                            shutil.rmtree(item_path)
+                            logger.debug(f"[SYSTEM] Deleted temp folder: {item_path}")
+                    except Exception as e:
+                        logger.warning(f"[SYSTEM] Failed to delete {item_path}: {e}")
+                
+                logger.info(f"[SYSTEM] {description}: Cleaned {local_files} items, freed {local_space / (1024 * 1024):.2f} MB")
+                
+            except Exception as e:
+                logger.warning(f"[SYSTEM] Error cleaning {description}: {e}")
+            
+            return local_files, local_space
+        
+        # 1. Clean Post-processing Temp Folder (matches Gradio UI)
+        if tb_processor is not None:
+            postproc_temp_dir = tb_processor._base_temp_output_dir
+            deleted, freed = clean_directory(postproc_temp_dir, "Post-processing temp folder")
+            files_deleted += deleted
+            space_freed += freed
+            
+            # 2. Clean Gradio Temp Folder (matches Gradio UI - this was missing!)
+            gradio_temp_dir = settings.get("gradio_temp_dir")
+            if gradio_temp_dir:
+                deleted, freed = clean_directory(gradio_temp_dir, "Gradio temp folder")
+                files_deleted += deleted
+                space_freed += freed
+        
+        # 3. Also clean API temp files (temp_* prefix files only)
+        if os.path.exists(api_output_dir):
+            api_deleted = 0
+            api_freed = 0
+            for item in os.listdir(api_output_dir):
+                if item.startswith("temp_"):
+                    item_path = os.path.join(api_output_dir, item)
+                    try:
+                        if os.path.isfile(item_path):
+                            size = os.path.getsize(item_path)
+                            os.remove(item_path)
+                            api_deleted += 1
+                            api_freed += size
+                            logger.debug(f"[SYSTEM] Deleted API temp file: {item_path}")
+                    except Exception as e:
+                        logger.warning(f"[SYSTEM] Failed to delete {item_path}: {e}")
+            
+            if api_deleted > 0:
+                logger.info(f"[SYSTEM] API temp files: Cleaned {api_deleted} items, freed {api_freed / (1024 * 1024):.2f} MB")
+            files_deleted += api_deleted
+            space_freed += api_freed
+        
+        space_freed_mb = space_freed / (1024 * 1024)
+        
+        logger.info(f"[SYSTEM] Clear temp complete: {files_deleted} files, freed {space_freed_mb:.2f} MB")
+        
+        return ClearTempResponse(
+            success=True,
+            message=f"Cleared {files_deleted} temporary file(s), freed {space_freed_mb:.2f} MB",
+            files_deleted=files_deleted,
+            space_freed_mb=round(space_freed_mb, 2)
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to clear temp files: {str(e)}"
+        logger.error(f"[SYSTEM] {error_msg}")
+        logger.error(f"[SYSTEM] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/system/status", response_model=SystemStatusResponse, tags=["System Utilities"])
+async def get_system_status(x_api_key: str = Header(None)):
+    """
+    Get current system status including RAM, VRAM, and GPU information.
+    
+    Returns:
+    - RAM: Total, used, available, percentage
+    - VRAM: Total, used, available, percentage (GPU memory)
+    - GPU: Name, utilization, temperature
+    
+    Useful for monitoring resources before/after heavy operations.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[SYSTEM] Status request")
+    
+    try:
+        # Get system info from SystemMonitor
+        system_info = SystemMonitor.get_system_info()
+        
+        logger.info(f"[SYSTEM] Status retrieved successfully")
+        
+        return SystemStatusResponse(
+            success=True,
+            message="System status retrieved successfully",
+            ram=system_info.get("ram"),
+            vram=system_info.get("vram"),
+            gpu=system_info.get("gpu")
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to get system status: {str(e)}"
+        logger.error(f"[SYSTEM] {error_msg}")
+        logger.error(f"[SYSTEM] Traceback: {traceback.format_exc()}")
+        
+        # Return partial info on error
+        return SystemStatusResponse(
+            success=False,
+            message=error_msg,
+            ram=None,
+            vram=None,
+            gpu=None
+        )
+
+
+@app.post("/postprocess/pipeline/from-preset", response_model=PipelineResponse, tags=["Post-Processing"])
+async def run_pipeline_from_preset(
+    preset_name: str,
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    x_api_key: str = Header(None)
+):
+    """
+    Run a processing pipeline using a saved workflow preset.
+    
+    This is a convenience endpoint that:
+    1. Loads the specified workflow preset
+    2. Builds operations from the preset's active_steps and params
+    3. Executes the pipeline
+    
+    Provide either video_base64 or video_url (not both).
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[PIPELINE] Run from preset request: {preset_name}")
+    
+    try:
+        # Refresh and get preset
+        _initialize_workflow_presets()
+        
+        if preset_name not in tb_workflow_presets_data:
+            raise HTTPException(status_code=404, detail=f"Workflow preset '{preset_name}' not found")
+        
+        preset = tb_workflow_presets_data[preset_name]
+        active_steps = preset.get("active_steps", [])
+        params = preset.get("params", {})
+        
+        if not active_steps:
+            raise HTTPException(status_code=400, detail="Preset has no active steps to execute")
+        
+        # Build operations from preset
+        operations = []
+        
+        # Map step names to operation types and build params
+        step_mapping = {
+            "Upscale": "upscale",
+            "Frame Adjust": "interpolate", 
+            "Loop": "loop",
+            "Filters": "filters",
+            "Export": "export"
+        }
+        
+        for step in active_steps:
+            op_type = step_mapping.get(step)
+            if not op_type:
+                logger.warning(f"[PIPELINE] Unknown step type: {step}")
+                continue
+            
+            op_params = {}
+            
+            if op_type == "upscale":
+                op_params = {
+                    "model": params.get("upscale_model", "RealESRGAN_x2plus"),
+                    "scale_factor": params.get("upscale_factor", 2.0),
+                    "tile_size": params.get("tile_size", 0),
+                    "enhance_face": params.get("enhance_face", False),
+                    "denoise_strength": params.get("denoise_strength", 0.5),
+                    "use_streaming": params.get("upscale_use_streaming", False)
+                }
+            elif op_type == "interpolate":
+                op_params = {
+                    "fps_mode": params.get("fps_mode", "No Interpolation"),
+                    "speed_factor": params.get("speed_factor", 1.0),
+                    "use_streaming": params.get("frames_use_streaming", False)
+                }
+            elif op_type == "loop":
+                op_params = {
+                    "loop_type": params.get("loop_type", "loop"),
+                    "num_loops": params.get("num_loops", 1)
+                }
+            elif op_type == "filters":
+                op_params = {
+                    "brightness": params.get("brightness", 0.0),
+                    "contrast": params.get("contrast", 1.0),
+                    "saturation": params.get("saturation", 1.0),
+                    "temperature": params.get("temperature", 0.0),
+                    "sharpen": params.get("sharpen", 0.0),
+                    "blur": params.get("blur", 0.0),
+                    "denoise": params.get("denoise", 0.0),
+                    "vignette": params.get("vignette", 0.0),
+                    "s_curve_contrast": params.get("s_curve_contrast", 0.0),
+                    "film_grain": params.get("film_grain_strength", 0.0)
+                }
+            elif op_type == "export":
+                op_params = {
+                    "format": params.get("export_format", "MP4"),
+                    "quality": params.get("export_quality", 85),
+                    "max_width": params.get("export_max_width", 1024)
+                }
+            
+            operations.append(PipelineOperation(type=op_type, params=op_params))
+        
+        if not operations:
+            raise HTTPException(status_code=400, detail="No valid operations could be built from preset")
+        
+        logger.info(f"[PIPELINE] Built {len(operations)} operations from preset")
+        
+        # Create pipeline request and call the existing pipeline endpoint
+        pipeline_req = PipelineRequest(
+            video_url=video_url,
+            video_base64=video_base64,
+            operations=operations
+        )
+        
+        # Call the pipeline endpoint directly
+        return await run_pipeline(pipeline_req, x_api_key)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to run pipeline from preset: {str(e)}"
+        logger.error(f"[PIPELINE] {error_msg}")
+        logger.error(f"[PIPELINE] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ============================================================================
+# PHASE 4: FILTER PRESETS, BATCH PROCESSING, MODEL MANAGEMENT
+# ============================================================================
+
+@app.get("/filters/presets", response_model=ListFilterPresetsResponse, tags=["Filter Presets"])
+async def list_filter_presets(x_api_key: str = Header(None)):
+    """
+    List all available filter presets.
+    
+    Filter presets save filter slider values for quick application.
+    Built-in presets include: none, cinematic, vintage, cool, warm, dramatic.
+    User presets are also listed.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[FILTERS] List presets request")
+    
+    try:
+        # Refresh presets from file
+        _initialize_filter_presets()
+        
+        logger.info(f"[FILTERS] Found {len(tb_filter_presets_data)} filter presets")
+        
+        return ListFilterPresetsResponse(
+            success=True,
+            presets=tb_filter_presets_data,
+            message=f"Found {len(tb_filter_presets_data)} filter preset(s)"
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to list filter presets: {str(e)}"
+        logger.error(f"[FILTERS] {error_msg}")
+        logger.error(f"[FILTERS] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/filters/presets", response_model=FilterPresetResponse, tags=["Filter Presets"])
+async def save_filter_preset(req: SaveFilterPresetRequest, x_api_key: str = Header(None)):
+    """
+    Save a new filter preset or update an existing one.
+    
+    Filter presets store values for all filter sliders:
+    brightness, contrast, saturation, temperature, sharpen, blur, 
+    denoise, vignette, s_curve_contrast, film_grain_strength.
+    
+    Note: The 'none' preset cannot be overwritten.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FILTERS] Save preset request: {req.name}")
+    
+    try:
+        global tb_filter_presets_data
+        
+        clean_name = req.name.strip()
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Preset name cannot be empty")
+        
+        if clean_name.lower() == "none":
+            raise HTTPException(status_code=400, detail="'none' is a protected preset and cannot be overwritten")
+        
+        # Convert settings to dict
+        preset_values = req.settings.model_dump()
+        
+        preset_existed = clean_name in tb_filter_presets_data
+        tb_filter_presets_data[clean_name] = preset_values
+        
+        # Save to file
+        with open(TB_BUILT_IN_PRESETS_FILE, 'w') as f:
+            json.dump(tb_filter_presets_data, f, indent=4)
+        
+        action = "updated" if preset_existed else "saved"
+        logger.info(f"[FILTERS] Preset '{clean_name}' {action} successfully")
+        
+        return FilterPresetResponse(
+            success=True,
+            message=f"Filter preset '{clean_name}' {action} successfully",
+            preset_name=clean_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to save filter preset: {str(e)}"
+        logger.error(f"[FILTERS] {error_msg}")
+        logger.error(f"[FILTERS] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.delete("/filters/presets/{name}", response_model=FilterPresetResponse, tags=["Filter Presets"])
+async def delete_filter_preset(name: str, x_api_key: str = Header(None)):
+    """
+    Delete a filter preset by name.
+    
+    Note: The 'none' preset cannot be deleted.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[FILTERS] Delete preset request: {name}")
+    
+    try:
+        global tb_filter_presets_data
+        
+        clean_name = name.strip()
+        
+        if clean_name.lower() == "none":
+            raise HTTPException(status_code=400, detail="'none' preset cannot be deleted")
+        
+        if clean_name not in tb_filter_presets_data:
+            raise HTTPException(status_code=404, detail=f"Filter preset '{clean_name}' not found")
+        
+        # Remove the preset
+        del tb_filter_presets_data[clean_name]
+        
+        # Save to file
+        with open(TB_BUILT_IN_PRESETS_FILE, 'w') as f:
+            json.dump(tb_filter_presets_data, f, indent=4)
+        
+        logger.info(f"[FILTERS] Preset '{clean_name}' deleted successfully")
+        
+        return FilterPresetResponse(
+            success=True,
+            message=f"Filter preset '{clean_name}' deleted successfully",
+            preset_name=clean_name
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to delete filter preset: {str(e)}"
+        logger.error(f"[FILTERS] {error_msg}")
+        logger.error(f"[FILTERS] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/postprocess/batch", response_model=BatchProcessingResponse, tags=["Post-Processing"])
+async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Header(None)):
+    """
+    Process multiple videos through the same pipeline.
+    
+    Each video in the batch will have the same operations applied.
+    Results are returned for each video individually.
+    
+    This is useful for processing a collection of videos with the same settings.
+    
+    Note: This operation can be resource-intensive for large batches.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[BATCH] Batch processing request: {len(req.videos)} videos, {len(req.operations)} operations")
+    
+    results = []
+    successful = 0
+    failed = 0
+    
+    try:
+        if tb_processor is None:
+            logger.error("[BATCH] Toolbox processor not initialized")
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Validate operation types
+        valid_ops = ["upscale", "interpolate", "filters", "loop", "export"]
+        for op in req.operations:
+            if op.type not in valid_ops:
+                raise HTTPException(status_code=400, detail=f"Invalid operation type: {op.type}")
+        
+        # Process each video
+        for i, video_item in enumerate(req.videos):
+            logger.info(f"[BATCH] Processing video {i+1}/{len(req.videos)}")
+            
+            temp_video_path = None
+            current_video_path = None
+            intermediate_files = []
+            
+            try:
+                # Get video source identifier
+                has_base64 = video_item.video_base64 is not None and len(video_item.video_base64) > 0
+                has_url = video_item.video_url is not None and len(video_item.video_url) > 0
+                
+                if not has_base64 and not has_url:
+                    results.append(BatchVideoResult(
+                        index=i,
+                        success=False,
+                        input_source="none",
+                        error="No video source provided"
+                    ))
+                    failed += 1
+                    continue
+                
+                input_source = "base64" if has_base64 else video_item.video_url[:50]
+                
+                # Get video to temp file
+                if has_base64:
+                    video_bytes = base64.b64decode(video_item.video_base64)
+                    temp_video_path = os.path.join(api_output_dir, f"temp_batch_{uuid.uuid4().hex[:8]}.mp4")
+                    with open(temp_video_path, 'wb') as f:
+                        f.write(video_bytes)
+                else:
+                    temp_video_path = await download_file_from_url(video_item.video_url, api_output_dir)
+                
+                current_video_path = temp_video_path
+                
+                # Apply each operation
+                for op in req.operations:
+                    output_path = None
+                    
+                    if op.type == "upscale":
+                        params = op.params or {}
+                        output_path = tb_processor.tb_upscale_video(
+                            video_path=current_video_path,
+                            model_key=params.get("model", "RealESRGAN_x2plus"),
+                            output_scale_factor_ui=params.get("scale_factor", 2.0),
+                            tile_size=params.get("tile_size", 512),
+                            enhance_face=params.get("enhance_face", False),
+                            denoise_strength_ui=params.get("denoise_strength", 0.5),
+                            use_streaming=params.get("use_streaming", True)
+                        )
+                    elif op.type == "interpolate":
+                        params = op.params or {}
+                        # Normalize fps_mode like the main interpolate endpoint does
+                        raw_fps_mode = params.get("fps_mode", "2x")
+                        fps_mode_mapping = {
+                            "2x": "2x Frames",
+                            "4x": "4x Frames",
+                            "2x Frames": "2x Frames",
+                            "4x Frames": "4x Frames",
+                            "No Interpolation": "No Interpolation",
+                            "none": "No Interpolation"
+                        }
+                        normalized_fps_mode = fps_mode_mapping.get(raw_fps_mode, "2x Frames")
+                        output_path = tb_processor.tb_process_frames(
+                            video_path=current_video_path,
+                            target_fps_mode=normalized_fps_mode,
+                            speed_factor=params.get("speed_factor", 1.0),
+                            use_streaming=params.get("use_streaming", True)
+                        )
+                    elif op.type == "filters":
+                        params = op.params or {}
+                        output_path = tb_processor.tb_apply_filters(
+                            video_path=current_video_path,
+                            brightness=params.get("brightness", 0.0),
+                            contrast=params.get("contrast", 1.0),
+                            saturation=params.get("saturation", 1.0),
+                            temperature=params.get("temperature", 0.0),
+                            sharpen=params.get("sharpen", 0.0),
+                            blur=params.get("blur", 0.0),
+                            denoise=params.get("denoise", 0.0),
+                            vignette=params.get("vignette", 0.0),
+                            s_curve_contrast=params.get("s_curve_contrast", 0.0),
+                            film_grain_strength=params.get("film_grain", 0.0)
+                        )
+                    elif op.type == "loop":
+                        params = op.params or {}
+                        output_path = tb_processor.tb_create_loop(
+                            video_path=current_video_path,
+                            loop_type=params.get("loop_type", "loop"),
+                            num_loops=params.get("num_loops", 2)
+                        )
+                    elif op.type == "export":
+                        params = op.params or {}
+                        output_path = tb_processor.tb_export_video(
+                            video_path=current_video_path,
+                            export_format=params.get("format", "MP4"),
+                            quality_slider=params.get("quality", 85),
+                            max_width=params.get("max_width") or 1920,
+                            output_base_name_override=params.get("output_name")
+                        )
+                    
+                    if output_path is None or not os.path.exists(output_path):
+                        raise Exception(f"Operation {op.type} failed")
+                    
+                    # Track intermediate files
+                    if current_video_path != temp_video_path and current_video_path != output_path:
+                        intermediate_files.append(current_video_path)
+                    
+                    current_video_path = output_path
+                
+                # Read final output
+                with open(current_video_path, 'rb') as f:
+                    output_base64 = base64.b64encode(f.read()).decode('utf-8')
+                
+                results.append(BatchVideoResult(
+                    index=i,
+                    success=True,
+                    input_source=input_source,
+                    output_video_base64=output_base64,
+                    output_path=current_video_path
+                ))
+                successful += 1
+                
+            except Exception as e:
+                logger.error(f"[BATCH] Video {i+1} failed: {str(e)}")
+                results.append(BatchVideoResult(
+                    index=i,
+                    success=False,
+                    input_source=input_source if 'input_source' in locals() else "unknown",
+                    error=str(e)
+                ))
+                failed += 1
+            
+            finally:
+                # Clean up temp and intermediate files
+                if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+                    try:
+                        os.remove(temp_video_path)
+                    except:
+                        pass
+                
+                for path in intermediate_files:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+        
+        logger.info(f"[BATCH] Batch complete: {successful}/{len(req.videos)} successful")
+        
+        # Send callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="batch",
+                success=failed == 0,
+                message=f"Batch processing complete: {successful} successful, {failed} failed",
+                metadata={
+                    "total_videos": len(req.videos),
+                    "successful": successful,
+                    "failed": failed,
+                    "operations_count": len(req.operations),
+                    "results_summary": [
+                        {
+                            "index": r.index,
+                            "success": r.success,
+                            "output_path": r.output_path,
+                            "error": r.error
+                        }
+                        for r in results
+                    ]
+                }
+            )
+        
+        return BatchProcessingResponse(
+            success=failed == 0,
+            message=f"Batch processing complete: {successful} successful, {failed} failed",
+            total_videos=len(req.videos),
+            successful=successful,
+            failed=failed,
+            results=results
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Batch processing failed: {str(e)}"
+        logger.error(f"[BATCH] {error_msg}")
+        logger.error(f"[BATCH] Traceback: {traceback.format_exc()}")
+        
+        # Send error callback if URL provided
+        if req.callback_url:
+            await send_postprocess_callback(
+                callback_url=req.callback_url,
+                operation="batch",
+                success=False,
+                error=error_msg,
+                message="Batch processing failed",
+                metadata={
+                    "total_videos": len(req.videos) if req.videos else 0,
+                    "operations_count": len(req.operations) if req.operations else 0
+                }
+            )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/postprocess/save", response_model=SaveVideoResponse, tags=["Post-Processing"])
+async def save_video_to_storage(req: SaveVideoRequest, x_api_key: str = Header(None)):
+    """
+    Save a video to permanent storage.
+    
+    Copies a video file to the permanent 'saved_videos' directory.
+    Useful when autosave is disabled and you want to keep a processed video.
+    
+    Provide either video_base64 or video_url.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[SAVE] Save video to permanent storage request")
+    
+    # Validate input
+    has_base64 = req.video_base64 is not None and len(req.video_base64) > 0
+    has_url = req.video_url is not None and len(req.video_url) > 0
+    
+    if not has_base64 and not has_url:
+        raise HTTPException(status_code=400, detail="Either video_base64 or video_url is required")
+    
+    temp_video_path = None
+    
+    try:
+        if tb_processor is None:
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Get video to temp file
+        if has_base64:
+            video_bytes = base64.b64decode(req.video_base64)
+            temp_video_path = os.path.join(api_output_dir, f"temp_save_{uuid.uuid4().hex[:8]}.mp4")
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+        else:
+            temp_video_path = await download_file_from_url(req.video_url, api_output_dir)
+        
+        # If custom name provided, rename the file first
+        if req.custom_name:
+            custom_filename = req.custom_name.strip()
+            if not custom_filename.lower().endswith(('.mp4', '.webm', '.gif')):
+                custom_filename += os.path.splitext(temp_video_path)[1]
+            new_temp_path = os.path.join(os.path.dirname(temp_video_path), custom_filename)
+            os.rename(temp_video_path, new_temp_path)
+            temp_video_path = new_temp_path
+        
+        # Copy to permanent storage
+        saved_path = tb_processor.tb_copy_video_to_permanent_storage(temp_video_path)
+        
+        if saved_path is None:
+            raise HTTPException(status_code=500, detail="Failed to save video to permanent storage")
+        
+        filename = os.path.basename(saved_path)
+        
+        logger.info(f"[SAVE] Video saved to: {saved_path}")
+        
+        return SaveVideoResponse(
+            success=True,
+            message="Video saved to permanent storage successfully",
+            saved_path=saved_path,
+            filename=filename
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to save video: {str(e)}"
+        logger.error(f"[SAVE] {error_msg}")
+        logger.error(f"[SAVE] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+    
+    finally:
+        # Clean up temp file if we created one from base64
+        if temp_video_path and has_base64 and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except:
+                pass
+
+
+@app.get("/postprocess/autosave", response_model=AutosaveSettingResponse, tags=["Post-Processing"])
+async def get_autosave_setting(x_api_key: str = Header(None)):
+    """
+    Get the current autosave setting.
+    
+    When autosave is enabled, processed videos are automatically 
+    saved to the permanent 'saved_videos' directory.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[AUTOSAVE] Get autosave setting request")
+    
+    try:
+        if tb_processor is None:
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Check if autosave is enabled by comparing output directories
+        is_autosave_enabled = tb_processor.toolbox_video_output_dir == tb_processor._base_permanent_save_dir
+        
+        return AutosaveSettingResponse(
+            success=True,
+            message=f"Autosave is {'enabled' if is_autosave_enabled else 'disabled'}",
+            autosave_enabled=is_autosave_enabled
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to get autosave setting: {str(e)}"
+        logger.error(f"[AUTOSAVE] {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/postprocess/autosave", response_model=AutosaveSettingResponse, tags=["Post-Processing"])
+async def set_autosave_setting(req: AutosaveSettingRequest, x_api_key: str = Header(None)):
+    """
+    Set the autosave mode.
+    
+    When enabled, all processed videos will be automatically saved to
+    the permanent 'saved_videos' directory.
+    
+    When disabled, videos are saved to the temp directory and may be 
+    cleaned up. Use /postprocess/save to manually save specific videos.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info(f"[AUTOSAVE] Set autosave request: {req.enabled}")
+    
+    try:
+        if tb_processor is None:
+            raise HTTPException(status_code=500, detail="Post-processing module not available")
+        
+        # Persist setting to settings file (like Gradio's tb_handle_autosave_toggle)
+        settings.set("toolbox_autosave_enabled", req.enabled)
+        logger.info(f"[AUTOSAVE] Persisted autosave setting to settings file: {req.enabled}")
+        
+        # Apply the setting to the processor
+        tb_processor.set_autosave_mode(req.enabled, silent=False)
+        
+        logger.info(f"[AUTOSAVE] Autosave {'enabled' if req.enabled else 'disabled'}")
+        
+        return AutosaveSettingResponse(
+            success=True,
+            message=f"Autosave {'enabled' if req.enabled else 'disabled'} successfully",
+            autosave_enabled=req.enabled
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to set autosave: {str(e)}"
+        logger.error(f"[AUTOSAVE] {error_msg}")
+        logger.error(f"[AUTOSAVE] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/model/unload", response_model=UnloadMainModelResponse, tags=["Model Management"])
+async def unload_main_model(x_api_key: str = Header(None)):
+    """
+    Unload the main video generation transformer model to free VRAM.
+    
+    Use this before running heavy post-processing operations (like 4K upscaling)
+    to maximize available GPU memory.
+    
+    The model will be reloaded automatically when the next generation job starts.
+    
+    Note: Cannot unload while a generation job is running.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[MODEL] Unload main model request")
+    
+    try:
+        import gc
+        
+        # Check if there's a current generator to unload
+        generator_to_unload = None
+        model_name = "Unknown"
+        
+        # Try to find the current generator in the main module
+        if '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'current_generator'):
+            generator_to_unload = sys.modules['__main__'].current_generator
+            logger.info("[MODEL] Found generator in __main__")
+        elif 'studio' in sys.modules and hasattr(sys.modules['studio'], 'current_generator'):
+            generator_to_unload = sys.modules['studio'].current_generator
+            logger.info("[MODEL] Found generator in studio module")
+        
+        if generator_to_unload is None:
+            logger.info("[MODEL] No active generator found to unload")
+            return UnloadMainModelResponse(
+                success=True,
+                message="No model currently loaded to unload",
+                model_unloaded=None,
+                vram_freed_estimate=None
+            )
+        
+        # Check if a job is currently running
+        job_queue = None
+        if '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'job_queue'):
+            job_queue = sys.modules['__main__'].job_queue
+        elif 'studio' in sys.modules and hasattr(sys.modules['studio'], 'job_queue'):
+            job_queue = sys.modules['studio'].job_queue
+        
+        if job_queue is not None:
+            current_job = getattr(job_queue, 'current_job', None)
+            if current_job is not None:
+                job_status = getattr(current_job, 'status', None)
+                if job_status is not None and hasattr(job_status, 'value') and job_status.value == 'running':
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Cannot unload model: A video generation job is currently running"
+                    )
+        
+        # Get model name before unloading
+        try:
+            if hasattr(generator_to_unload, 'get_model_name') and callable(generator_to_unload.get_model_name):
+                model_name = generator_to_unload.get_model_name()
+            elif hasattr(generator_to_unload, 'transformer') and generator_to_unload.transformer is not None:
+                model_name = generator_to_unload.transformer.__class__.__name__
+            else:
+                model_name = generator_to_unload.__class__.__name__
+        except:
+            pass
+        
+        # Unload the model (matching Gradio's tb_handle_delete_studio_transformer)
+        logger.info(f"[MODEL] Unloading model: {model_name}")
+        
+        # Step 1: Unload LoRAs first if available
+        if hasattr(generator_to_unload, 'unload_loras') and callable(generator_to_unload.unload_loras):
+            logger.info("[MODEL] Unloading LoRAs from transformer...")
+            try:
+                generator_to_unload.unload_loras()
+                logger.info("[MODEL] LoRAs unloaded successfully")
+            except Exception as e_lora:
+                logger.warning(f"[MODEL] LoRA unload failed (non-critical): {e_lora}")
+        
+        # Step 2: Move transformer to CPU before deletion (safer memory cleanup)
+        if hasattr(generator_to_unload, 'transformer') and generator_to_unload.transformer is not None:
+            transformer_ref = generator_to_unload.transformer
+            transformer_name = transformer_ref.__class__.__name__
+            
+            # Move to CPU first for cleaner VRAM release
+            if hasattr(transformer_ref, 'to') and callable(transformer_ref.to):
+                try:
+                    logger.info(f"[MODEL] Moving transformer ({transformer_name}) to CPU...")
+                    cpu_device = torch.device('cpu')
+                    transformer_ref.to(cpu_device)
+                    logger.info(f"[MODEL] Transformer moved to CPU successfully")
+                except Exception as e_cpu:
+                    logger.warning(f"[MODEL] Failed to move to CPU (non-critical): {e_cpu}")
+            
+            # Now delete the transformer
+            logger.info(f"[MODEL] Deleting transformer reference...")
+            generator_to_unload.transformer = None
+            del transformer_ref
+            logger.info(f"[MODEL] Transformer deleted")
+        
+        # Clear from module
+        if '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'current_generator'):
+            sys.modules['__main__'].current_generator = None
+        if 'studio' in sys.modules and hasattr(sys.modules['studio'], 'current_generator'):
+            sys.modules['studio'].current_generator = None
+        
+        # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        logger.info(f"[MODEL] Model '{model_name}' unloaded successfully")
+        
+        return UnloadMainModelResponse(
+            success=True,
+            message=f"Model '{model_name}' unloaded successfully. VRAM freed.",
+            model_unloaded=model_name,
+            vram_freed_estimate="~12-24 GB (varies by model)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to unload model: {str(e)}"
+        logger.error(f"[MODEL] {error_msg}")
+        logger.error(f"[MODEL] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/model/status", tags=["Model Management"])
+async def get_model_status(x_api_key: str = Header(None)):
+    """
+    Get the status of the main video generation model.
+    
+    Returns whether a model is currently loaded and its name.
+    """
+    validate_api_key(x_api_key)
+    
+    logger.info("[MODEL] Get model status request")
+    
+    try:
+        generator = None
+        model_name = None
+        model_loaded = False
+        
+        # Try to find the current generator
+        if '__main__' in sys.modules and hasattr(sys.modules['__main__'], 'current_generator'):
+            generator = sys.modules['__main__'].current_generator
+        elif 'studio' in sys.modules and hasattr(sys.modules['studio'], 'current_generator'):
+            generator = sys.modules['studio'].current_generator
+        
+        if generator is not None:
+            model_loaded = True
+            try:
+                if hasattr(generator, 'get_model_name') and callable(generator.get_model_name):
+                    model_name = generator.get_model_name()
+                elif hasattr(generator, 'transformer') and generator.transformer is not None:
+                    model_name = generator.transformer.__class__.__name__
+                else:
+                    model_name = generator.__class__.__name__
+            except:
+                model_name = "Unknown"
+        
+        return {
+            "model_loaded": model_loaded,
+            "model_name": model_name,
+            "vram_usage": get_cuda_free_memory_gb() if torch.cuda.is_available() else None
+        }
+        
+    except Exception as e:
+        error_msg = f"Failed to get model status: {str(e)}"
+        logger.error(f"[MODEL] {error_msg}")
+        return {
+            "model_loaded": False,
+            "model_name": None,
+            "error": error_msg
+        }
 
 
 @app.post("/generate", response_model=GenerationResponse, tags=["Generation"])
@@ -1197,6 +4918,91 @@ async def send_job_callback(job_id: str, job: Any, base_url: str = "http://local
         logger.error(f"Callback timeout for job {job_id} to {callback_url}")
     except Exception as e:
         logger.error(f"Callback error for job {job_id}: {str(e)}")
+
+
+async def send_postprocess_callback(
+    callback_url: str,
+    operation_type: str,
+    success: bool,
+    output_path: Optional[str] = None,
+    output_base64: Optional[str] = None,
+    error: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None
+):
+    """
+    Send a callback/webhook POST request when a post-processing operation completes.
+    Used by all Phase 1-4 endpoints that support callbacks.
+    
+    Args:
+        callback_url: URL to POST results to
+        operation_type: Type of operation (upscale, interpolate, filters, etc.)
+        success: Whether the operation succeeded
+        output_path: Local path to the output file
+        output_base64: Base64-encoded output (optional, can be large)
+        error: Error message if operation failed
+        metadata: Additional operation-specific metadata
+    """
+    if not callback_url:
+        return
+    
+    logger.info(f"[CALLBACK] Sending post-process callback for '{operation_type}' to {callback_url}")
+    
+    try:
+        # Build callback payload
+        payload = {
+            "type": "postprocess",
+            "operation": operation_type,
+            "success": success,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        if success and output_path:
+            filename = os.path.basename(output_path)
+            payload["output_filename"] = filename
+            payload["output_path"] = output_path
+            payload["output_url"] = f"{BASE_URL}/outputs/{filename}"
+            
+            # Add file size if available
+            try:
+                payload["output_file_size"] = os.path.getsize(output_path)
+            except:
+                pass
+            
+            # Include base64 output if provided (can be large!)
+            if output_base64:
+                payload["output_base64"] = output_base64
+        
+        if error:
+            payload["error"] = error
+        
+        if metadata:
+            payload["metadata"] = metadata
+        
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json",
+            "X-Operation-Type": operation_type,
+        }
+        
+        # Send the callback
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60)  # Longer timeout for potentially large payloads
+            ) as response:
+                response_text = await response.text()
+                if response.status >= 200 and response.status < 300:
+                    logger.info(f"[CALLBACK] Post-process callback successful for '{operation_type}': {response.status}")
+                    logger.debug(f"[CALLBACK] Response: {response_text[:200]}...")
+                else:
+                    logger.warning(f"[CALLBACK] Post-process callback failed for '{operation_type}': {response.status} - {response_text}")
+                    
+    except asyncio.TimeoutError:
+        logger.error(f"[CALLBACK] Timeout sending callback for '{operation_type}' to {callback_url}")
+    except Exception as e:
+        logger.error(f"[CALLBACK] Error sending callback for '{operation_type}': {str(e)}")
 
 
 # Background task to check for completed jobs and send callbacks

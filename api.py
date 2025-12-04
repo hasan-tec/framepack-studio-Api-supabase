@@ -3226,7 +3226,7 @@ async def extract_frames(req: ExtractFramesRequest, x_api_key: str = Header(None
             logger.info(f"[FRAMES] Temp video saved: {temp_video_path}")
         else:
             logger.info(f"[FRAMES] Downloading video from URL for extraction...")
-            temp_video_path = await download_file_from_url(req.video_url, api_output_dir)
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
             logger.info(f"[FRAMES] Video downloaded: {temp_video_path}")
         
         if tb_processor is None:
@@ -4270,7 +4270,7 @@ async def batch_process_videos(req: BatchProcessingRequest, x_api_key: str = Hea
                     with open(temp_video_path, 'wb') as f:
                         f.write(video_bytes)
                 else:
-                    temp_video_path = await download_file_from_url(video_item.video_url, api_output_dir)
+                    temp_video_path = download_file_from_url(video_item.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
                 
                 current_video_path = temp_video_path
                 
@@ -4485,7 +4485,7 @@ async def save_video_to_storage(req: SaveVideoRequest, x_api_key: str = Header(N
             with open(temp_video_path, 'wb') as f:
                 f.write(video_bytes)
         else:
-            temp_video_path = await download_file_from_url(req.video_url, api_output_dir)
+            temp_video_path = download_file_from_url(req.video_url, ['.mp4', '.webm', '.avi', '.mov', '.mkv'])
         
         # If custom name provided, rename the file first
         if req.custom_name:

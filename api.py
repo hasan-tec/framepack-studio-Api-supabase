@@ -3194,7 +3194,8 @@ async def extract_frames(req: ExtractFramesRequest, x_api_key: str = Header(None
         logger.info(f"[FRAMES] Starting extraction with rate={req.extraction_rate}...")
         output_folder = tb_processor.tb_extract_frames(
             video_path=temp_video_path,
-            extraction_rate=req.extraction_rate
+            extraction_rate=req.extraction_rate,
+            progress=DummyProgress()
         )
         
         if output_folder is None or not os.path.exists(output_folder):
@@ -3539,7 +3540,8 @@ async def reassemble_frames(req: ReassembleFramesRequest, x_api_key: str = Heade
         output_path = tb_processor.tb_reassemble_frames_to_video(
             frames_source=frames_path,
             output_fps=req.output_fps,
-            output_base_name_override=req.output_name
+            output_base_name_override=req.output_name,
+            progress=DummyProgress()
         )
         
         if output_path is None or not os.path.exists(output_path):
